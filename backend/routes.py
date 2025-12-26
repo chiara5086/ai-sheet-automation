@@ -1,0 +1,380 @@
+
+from fastapi import APIRouter, HTTPException, Query
+from pydantic import BaseModel
+from google_sheets import get_sheet_data, update_sheet_data
+import re
+from sheet_utils import find_column_indices
+from process_steps import build_description
+
+
+def get_column_letter(col_idx):
+    """
+    Convert a zero-based column index to Google Sheets column letter (A, B, ..., Z, AA, AB, ...).
+    
+    Args:
+        col_idx: Zero-based column index
+        
+    Returns:
+        Column letter(s) as string (e.g., 'A', 'Z', 'AA', 'AB')
+    """
+    result = ""
+    col_idx += 1  # Convert to 1-based
+    while col_idx > 0:
+        col_idx -= 1
+        result = chr(65 + (col_idx % 26)) + result
+        col_idx //= 26
+    return result
+
+
+
+router = APIRouter()
+
+# Pydantic model for process step request
+class ProcessRequest(BaseModel):
+    sheetId: str
+    step: str
+    sheet_name: str = None
+
+# Simple test endpoint to verify POST requests work
+@router.post("/test-process")
+async def test_process():
+    import sys
+    import os
+    import logging
+    logger = logging.getLogger(__name__)
+    
+    msg = "\n" + "="*70 + "\nTEST PROCESS ENDPOINT CALLED\n" + "="*70 + "\n"
+    
+    # Try every way to output
+    try:
+        os.write(1, msg.encode('utf-8'))
+        os.write(2, msg.encode('utf-8'))
+    except:
+        pass
+    
+    sys.stdout.write(msg)
+    sys.stdout.flush()
+    sys.stderr.write(msg)
+    sys.stderr.flush()
+    
+    logger.info(msg)
+    
+    return {"status": "ok", "message": "Test process endpoint works"}
+
+def extract_sheet_id(sheet_url):
+    match = re.search(r"/d/([a-zA-Z0-9-_]+)", sheet_url)
+    if match:
+        return match.group(1)
+    return None
+
+def find_structured_data_tab(sheet_id):
+    """Find the first tab that starts with 'Structured Data'."""
+    print(f"DEBUG: find_structured_data_tab called for sheet_id: {sheet_id}", flush=True)
+    try:
+        from google_sheets import get_service
+        print(f"DEBUG: Getting service...", flush=True)
+        service = get_service()
+        print(f"DEBUG: Fetching sheet metadata...", flush=True)
+        sheet_metadata = service.spreadsheets().get(spreadsheetId=sheet_id).execute()
+        print(f"DEBUG: Sheet metadata received", flush=True)
+        sheets = sheet_metadata.get('sheets', [])
+        print(f"DEBUG: Found {len(sheets)} sheets", flush=True)
+        for sheet in sheets:
+            title = sheet.get('properties', {}).get('title', '')
+            if title.startswith('Structured Data'):
+                print(f"DEBUG: Found Structured Data tab: {title}", flush=True)
+                return title
+        print(f"DEBUG: No Structured Data tab found", flush=True)
+        return None
+    except Exception as e:
+        print(f"ERROR: Exception in find_structured_data_tab: {e}", flush=True)
+        import traceback
+        traceback.print_exc()
+        return None
+
+@router.get("/sheet-preview")
+def sheet_preview(sheet_url: str = Query(..., description="Google Sheet URL"), sheet_name: str = None):
+    sheet_id = extract_sheet_id(sheet_url)
+    if not sheet_id:
+        raise HTTPException(status_code=400, detail="Invalid Google Sheet URL")
+    
+    # Auto-detect Structured Data tab if not provided
+    if not sheet_name:
+        sheet_name = find_structured_data_tab(sheet_id)
+        print(f"DEBUG: Auto-detected tab: {sheet_name}")
+    
+    range_name = f"{sheet_name}!A2:1000" if sheet_name else "A2:1000"
+    data = get_sheet_data(sheet_id, range_name)
+    return {
+        "headers": data[0] if data else [], 
+        "rows": data[1:] if len(data) > 1 else [],
+        "sheet_name": sheet_name  # Return detected sheet name
+    }
+
+@router.post("/process")
+def process_step(request: ProcessRequest):
+    import sys
+    import logging
+    logger = logging.getLogger(__name__)
+    
+    # Force immediate output
+    sys.stdout.write(f"\n{'='*60}\n")
+    sys.stdout.write(f"DEBUG: /process endpoint called\n")
+    sys.stdout.write(f"DEBUG: Step: {request.step}\n")
+    sys.stdout.write(f"DEBUG: Sheet ID: {request.sheetId}\n")
+    sys.stdout.write(f"DEBUG: Sheet name: {request.sheet_name}\n")
+    sys.stdout.write(f"{'='*60}\n\n")
+    sys.stdout.flush()
+    
+    logger.info(f"\n{'='*60}")
+    logger.info(f"DEBUG: /process endpoint called")
+    logger.info(f"DEBUG: Step: {request.step}")
+    logger.info(f"DEBUG: Sheet ID: {request.sheetId}")
+    logger.info(f"DEBUG: Sheet name: {request.sheet_name}")
+    logger.info(f"{'='*60}\n")
+    
+    try:
+        sheetId = request.sheetId
+        step = request.step
+        sheet_name = request.sheet_name
+        
+        # Auto-detect Structured Data tab if not provided
+        if not sheet_name:
+            print(f"DEBUG: sheet_name is None, calling find_structured_data_tab...", flush=True)
+            sheet_name = find_structured_data_tab(sheetId)
+            print(f"DEBUG: Auto-detected tab for process: {sheet_name}", flush=True)
+        else:
+            print(f"DEBUG: Using provided sheet_name: {sheet_name}", flush=True)
+        
+        if not sheet_name:
+            raise HTTPException(status_code=400, detail="Could not find 'Structured Data' tab in sheet")
+        
+        # Fetch headers and rows (headers in row 2, data from row 3)
+        range_name = f"{sheet_name}!A2:1000"
+        print(f"DEBUG: Reading from range: {range_name}", flush=True)
+        print(f"DEBUG: Calling get_sheet_data...", flush=True)
+        data = get_sheet_data(sheetId, range_name)
+        print(f"DEBUG: get_sheet_data completed, got {len(data) if data else 0} rows", flush=True)
+        if not data or len(data) < 2:
+            raise HTTPException(status_code=400, detail="Sheet missing headers or data.")
+        headers = data[0]
+        rows = data[1:]
+        
+        # Debug: Print all headers
+        print(f"\nDEBUG: Total headers found: {len(headers)}", flush=True)
+        print(f"DEBUG: First 10 headers: {headers[:10]}", flush=True)
+        print(f"DEBUG: All headers with indices:", flush=True)
+        for idx, header in enumerate(headers):
+            print(f"  [{idx}] '{header}'", flush=True)
+
+        # Select required columns per step
+        if step == "Build Description":
+            required_names = [
+                r"YOM OEM Model T[234] Category",
+                r"Technical Specifications",
+                r"AI Description"
+            ]
+        elif step == "AI Source Comparables":
+            required_names = [
+                r"YOM OEM Model",  # Will match "YOM OEM Model T3 Category" or any variation containing this
+                r"Technical Specifications",  # Exact or partial match
+                r"AI Comparable Price"  # Column to fill
+            ]
+        elif step == "Extract price from AI Comparable":
+            # Required columns for price extraction - search by exact name or flexible pattern
+            # We search by name, not by position, so columns can be in any order
+            required_names = [
+                r"YOM OEM Model",  # Will match "YOM OEM Model T3 Category" or any variation containing this
+                r"Technical Specifications",  # Exact or partial match
+                r"AI Comparable Price",  # Exact or partial match
+                r"Price"  # Must be exact "Price" (not "AI Comparable Price")
+            ]
+            # AI Data is optional but recommended, so check if present
+            if any(re.search(r"AI Data", h, re.IGNORECASE) for h in headers):
+                required_names.append(r"AI Data")
+        else:
+            required_names = [
+                r"YOM OEM Model T[234] Category",
+                r"Technical Specifications",
+                r"AI Data",
+                r"AI Description",
+                r"AI Comparable Price",
+                r"Price"
+            ]
+
+        col_indices = find_column_indices(headers, required_names)
+        
+        # Debug: Print all found columns
+        print(f"DEBUG: Found columns:", flush=True)
+        for name, idx in col_indices.items():
+            if idx is not None:
+                print(f"  - '{name}': index {idx} (header: '{headers[idx] if idx < len(headers) else 'N/A'}')", flush=True)
+            else:
+                print(f"  - '{name}': NOT FOUND", flush=True)
+        
+        # Only require columns that are truly required for the step
+        truly_required = [n for n in required_names if n != r"AI Data"]
+        missing = [k for k in truly_required if col_indices.get(k) is None]
+        if missing:
+            return {"status": "error", "missing_headers": missing, "available_headers": headers}
+
+        # Run the selected process step
+        errors = []
+        updated_rows = rows
+        if step == "Build Description":
+            updated_rows, errors = build_description(rows, col_indices)
+            # Write back only the description column
+            desc_idx = col_indices.get('AI Description')
+            if desc_idx is not None:
+                col_letter = get_column_letter(desc_idx)
+                # Calculate the range: from row 3 to row (3 + number of rows - 1)
+                start_row = 3
+                end_row = start_row + len(updated_rows) - 1
+                out_range = f"{sheet_name}!{col_letter}{start_row}:{col_letter}{end_row}" if sheet_name else f"{col_letter}{start_row}:{col_letter}{end_row}"
+                values = [[row[desc_idx] if len(row) > desc_idx else ""] for row in updated_rows]
+                update_sheet_data(sheetId, out_range, values)
+        elif step == "AI Source Comparables":
+            print(f"\n{'='*60}", flush=True)
+            print(f"DEBUG: Starting AI Source Comparables", flush=True)
+            print(f"DEBUG: Processing {len(rows)} rows", flush=True)
+            print(f"{'='*60}\n", flush=True)
+            from process_steps import ai_source_comparables
+            updated_rows, errors = ai_source_comparables(rows, col_indices)
+            print(f"\nDEBUG: ai_source_comparables completed. {len(errors)} errors\n", flush=True)
+            # Write back only the AI Comparable Price column
+            comparable_idx = col_indices.get('AI Comparable Price')
+            if comparable_idx is not None:
+                col_letter = get_column_letter(comparable_idx)
+                start_row = 3
+                end_row = start_row + len(updated_rows) - 1
+                out_range = f"{sheet_name}!{col_letter}{start_row}:{col_letter}{end_row}" if sheet_name else f"{col_letter}{start_row}:{col_letter}{end_row}"
+                values = [[row[comparable_idx] if len(row) > comparable_idx else ""] for row in updated_rows]
+                update_sheet_data(sheetId, out_range, values)
+                print(f"DEBUG: Wrote {len(updated_rows)} comparable entries to column {col_letter}", flush=True)
+        elif step == "Extract price from AI Comparable":
+            print(f"\n{'='*60}", flush=True)
+            print(f"DEBUG: Starting Extract price from AI Comparable", flush=True)
+            print(f"DEBUG: Processing {len(rows)} rows", flush=True)
+            print(f"{'='*60}\n", flush=True)
+            from process_steps import extract_final_price
+            updated_rows, errors, filled_rows = extract_final_price(rows, col_indices)
+            print(f"\nDEBUG: extract_final_price completed. Filled {len(filled_rows)} rows, {len(errors)} errors\n", flush=True)
+            # Write back only the price column - but only update rows that were actually filled
+            price_idx = col_indices.get('Price')
+            filled_rows_list = filled_rows
+            
+            # Count empty price rows before processing (for stats)
+            empty_before = 0
+            if price_idx is not None:
+                for row in rows:
+                    if len(row) <= price_idx or not row[price_idx] or not str(row[price_idx]).strip():
+                        empty_before += 1
+            
+            if price_idx is not None and filled_rows:
+                col_letter = get_column_letter(price_idx)
+                print(f"DEBUG: Writing {len(filled_rows)} prices to column {col_letter}", flush=True)  # Debug log
+                
+                # Update each filled row individually for accuracy
+                for row_num in filled_rows:
+                    # Convert sheet row number to array index (row 3 = index 0)
+                    array_idx = row_num - 3
+                    if 0 <= array_idx < len(updated_rows):
+                        row = updated_rows[array_idx]
+                        price_value = row[price_idx] if len(row) > price_idx else ""
+                        if price_value:  # Only update if we have a value
+                            cell_range = f"{sheet_name}!{col_letter}{row_num}" if sheet_name else f"{col_letter}{row_num}"
+                            try:
+                                update_sheet_data(sheetId, cell_range, [[price_value]])
+                                # Apply light blue color (#c9daf8) for Extract price step
+                                from google_sheets import format_cell_color
+                                format_cell_color(sheetId, sheet_name, col_letter, row_num, '#c9daf8')
+                                print(f"DEBUG: Updated row {row_num} with price {price_value} (light blue)", flush=True)  # Debug log
+                            except Exception as e:
+                                errors.append(f'Row {row_num}: Failed to write to sheet: {str(e)}')
+                                print(f"ERROR: Failed to update row {row_num}: {e}", flush=True)  # Debug log
+            else:
+                print(f"DEBUG: No rows to fill. Empty rows before: {empty_before}, Filled rows: {len(filled_rows) if filled_rows else 0}", flush=True)
+        elif step == "AI Source New Price":
+            print(f"\n{'='*60}", flush=True)
+            print(f"DEBUG: Starting AI Source New Price", flush=True)
+            print(f"DEBUG: Processing {len(rows)} rows", flush=True)
+            print(f"{'='*60}\n", flush=True)
+            from process_steps import ai_source_new_price
+            updated_rows, errors, filled_rows = ai_source_new_price(rows, col_indices)
+            print(f"\nDEBUG: ai_source_new_price completed. Filled {len(filled_rows)} rows, {len(errors)} errors\n", flush=True)
+            # Write back only the price column - but only update rows that were actually filled
+            price_idx = col_indices.get('Price')
+            filled_rows_list = filled_rows
+            
+            # Count empty price rows before processing (for stats)
+            empty_before = 0
+            if price_idx is not None:
+                for row in rows:
+                    if len(row) <= price_idx or not row[price_idx] or not str(row[price_idx]).strip():
+                        empty_before += 1
+            
+            if price_idx is not None and filled_rows:
+                col_letter = get_column_letter(price_idx)
+                print(f"DEBUG: Writing {len(filled_rows)} new prices to column {col_letter}", flush=True)  # Debug log
+                
+                # Update each filled row individually for accuracy
+                for row_num in filled_rows:
+                    # Convert sheet row number to array index (row 3 = index 0)
+                    array_idx = row_num - 3
+                    if 0 <= array_idx < len(updated_rows):
+                        row = updated_rows[array_idx]
+                        price_value = row[price_idx] if len(row) > price_idx else ""
+                        if price_value:  # Only update if we have a value
+                            cell_range = f"{sheet_name}!{col_letter}{row_num}" if sheet_name else f"{col_letter}{row_num}"
+                            try:
+                                update_sheet_data(sheetId, cell_range, [[price_value]])
+                                # Apply light yellow color (#fff2cc) for AI Source New Price step
+                                from google_sheets import format_cell_color
+                                format_cell_color(sheetId, sheet_name, col_letter, row_num, '#fff2cc')
+                                print(f"DEBUG: Updated row {row_num} with new price {price_value} (light yellow)", flush=True)  # Debug log
+                            except Exception as e:
+                                errors.append(f'Row {row_num}: Failed to write to sheet: {str(e)}')
+                                print(f"ERROR: Failed to update row {row_num}: {e}", flush=True)  # Debug log
+            else:
+                print(f"DEBUG: No rows to fill. Empty rows before: {empty_before}, Filled rows: {len(filled_rows) if filled_rows else 0}", flush=True)
+        else:
+            return {"status": "error", "detail": f"Step '{step}' not implemented."}
+
+        # Find any rows where Price is still empty
+        price_idx = col_indices.get('Price')
+        empty_prices = []
+        if price_idx is not None:
+            for i, row in enumerate(updated_rows):
+                if len(row) <= price_idx or not row[price_idx]:
+                    empty_prices.append(i+3)  # Row number in sheet
+
+        # Prepare response
+        response_data = {
+            "status": "ok",
+            "step": step,
+            "errors": errors,
+            "empty_price_rows": empty_prices
+        }
+        
+        # Add filled_rows if available (for Extract price and AI Source New Price steps)
+        if step in ["Extract price from AI Comparable", "AI Source New Price"] and 'filled_rows_list' in locals():
+            response_data["filled_rows"] = filled_rows_list
+            # Add stats for better frontend feedback
+            response_data["stats"] = {
+                "total_rows": len(rows),
+                "empty_before": empty_before if 'empty_before' in locals() else len(empty_prices),
+                "filled": len(filled_rows_list),
+                "empty_after": len(empty_prices),
+                "errors_count": len(errors)
+            }
+        
+        print(f"DEBUG: Returning response: {response_data}", flush=True)
+        return response_data
+    
+    except Exception as e:
+        import traceback
+        error_msg = f"Error in process_step: {str(e)}"
+        print(f"❌ {error_msg}", flush=True)
+        print(f"Traceback:", flush=True)
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=error_msg)
