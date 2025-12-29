@@ -8,16 +8,18 @@ export const fetchSheetPreview = async (sheetUrl, sheetName) => {
   return axios.get(`${API_BASE}/sheet-preview`, { params: { sheet_url: sheetUrl, sheet_name: sheetName } });
 };
 
-export const runProcessStep = async (sheetId, step, sheetName = null, signal = null) => {
+export const runProcessStep = async (sheetId, step, sheetName = null, signal = null, sessionId = null, customPrompt = null) => {
   console.log(`DEBUG: Making POST request to ${API_BASE}/process`);
-  console.log(`DEBUG: Payload:`, { sheetId, step, sheet_name: sheetName });
+  console.log(`DEBUG: Payload:`, { sheetId, step, sheet_name: sheetName, session_id: sessionId, custom_prompt: customPrompt ? 'provided' : 'none' });
   console.log(`DEBUG: Full URL: ${API_BASE}/process`);
   
   try {
     const response = await axios.post(`${API_BASE}/process`, { 
       sheetId, 
       step, 
-      sheet_name: sheetName 
+      sheet_name: sheetName,
+      session_id: sessionId,
+      custom_prompt: customPrompt
     }, {
       timeout: 1800000, // 30 minutes timeout for long processing (100k rows will take time)
       headers: {

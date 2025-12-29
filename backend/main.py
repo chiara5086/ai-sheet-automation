@@ -1,13 +1,15 @@
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 import logging
 import sys
 import os
+import uuid
 
 # Import config early to trigger environment variable loading and logging
 import config
 
 from routes import router
+from websocket_manager import manager
 
 # Configure logging to show in console - FORCE IT
 logging.basicConfig(
@@ -98,14 +100,38 @@ async def log_requests(request: Request, call_next):
 
 logger.info("✅ Middleware registered")
 
-# Allow CORS for frontend
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+# Allow CORS for frontend (local and deployed)
+allowed_origins = [
+    "http://localhost:4000",
+    "http://localhost:3000",
+    "http://127.0.0.1:4000",
+    "http://127.0.0.1:3000",
+]
+
+# Add Vercel domain if provided via environment variable
+vercel_url = os.getenv("VERCEL_URL")
+if vercel_url:
+    allowed_origins.append(f"https://{vercel_url}")
+    allowed_origins.append(f"http://{vercel_url}")
+
+# Allow all origins in development, specific origins in production
+if os.getenv("ENVIRONMENT") == "production":
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=allowed_origins,
+        allow_credentials=True,
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
+else:
+    # Development: allow all origins
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=["*"],
+        allow_credentials=True,
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
 
 # Include router without prefix
 app.include_router(router, tags=["api"])
@@ -160,3 +186,14 @@ def health_check():
 def test_endpoint(request: Request):
     logger.info("DEBUG: /test endpoint called")
     return {"status": "ok", "message": "Test endpoint works"}
+
+@app.websocket("/ws/{session_id}")
+async def websocket_endpoint(websocket: WebSocket, session_id: str):
+    await manager.connect(websocket, session_id)
+    try:
+        while True:
+            data = await websocket.receive_text()
+            # Echo back or handle client messages if needed
+            await manager.send_personal_message({"type": "pong", "data": data}, websocket)
+    except WebSocketDisconnect:
+        manager.disconnect(websocket, session_id)

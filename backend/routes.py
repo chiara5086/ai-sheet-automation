@@ -5,6 +5,7 @@ from google_sheets import get_sheet_data, update_sheet_data
 import re
 from sheet_utils import find_column_indices
 from process_steps import build_description
+from websocket_manager import manager
 
 
 def get_column_letter(col_idx):
@@ -34,6 +35,8 @@ class ProcessRequest(BaseModel):
     sheetId: str
     step: str
     sheet_name: str = None
+    session_id: str = None  # For WebSocket updates
+    custom_prompt: str = None  # Custom prompt to use instead of default
 
 # Simple test endpoint to verify POST requests work
 @router.post("/test-process")
@@ -112,7 +115,7 @@ def sheet_preview(sheet_url: str = Query(..., description="Google Sheet URL"), s
     }
 
 @router.post("/process")
-def process_step(request: ProcessRequest):
+async def process_step(request: ProcessRequest):
     import sys
     import logging
     logger = logging.getLogger(__name__)
@@ -160,6 +163,18 @@ def process_step(request: ProcessRequest):
         headers = data[0]
         rows = data[1:]
         
+        # Send initial progress update via WebSocket
+        if request.session_id:
+            await manager.broadcast_to_session(request.session_id, {
+                "type": "progress",
+                "step": step,
+                "total": len(rows),
+                "processed": 0,
+                "success": 0,
+                "errors": 0,
+                "skipped": 0,
+            })
+        
         # Debug: Print all headers
         print(f"\nDEBUG: Total headers found: {len(headers)}", flush=True)
         print(f"DEBUG: First 10 headers: {headers[:10]}", flush=True)
@@ -192,6 +207,15 @@ def process_step(request: ProcessRequest):
             # AI Data is optional but recommended, so check if present
             if any(re.search(r"AI Data", h, re.IGNORECASE) for h in headers):
                 required_names.append(r"AI Data")
+        elif step == "AI Similar Comparable":
+            required_names = [
+                r"YOM OEM Model",  # Will match "YOM OEM Model T3 Category" or any variation containing this
+                r"Technical Specifications",  # Exact or partial match
+                r"Price"  # Column to fill
+            ]
+            # AI Data is optional but recommended
+            if any(re.search(r"AI Data", h, re.IGNORECASE) for h in headers):
+                required_names.append(r"AI Data")
         else:
             required_names = [
                 r"YOM OEM Model T[234] Category",
@@ -221,8 +245,10 @@ def process_step(request: ProcessRequest):
         # Run the selected process step
         errors = []
         updated_rows = rows
+        custom_prompt = request.custom_prompt  # Get custom prompt if provided
+        
         if step == "Build Description":
-            updated_rows, errors = build_description(rows, col_indices)
+            updated_rows, errors = build_description(rows, col_indices, custom_prompt=custom_prompt)
             # Write back only the description column
             desc_idx = col_indices.get('AI Description')
             if desc_idx is not None:
@@ -239,7 +265,7 @@ def process_step(request: ProcessRequest):
             print(f"DEBUG: Processing {len(rows)} rows", flush=True)
             print(f"{'='*60}\n", flush=True)
             from process_steps import ai_source_comparables
-            updated_rows, errors = ai_source_comparables(rows, col_indices)
+            updated_rows, errors = ai_source_comparables(rows, col_indices, custom_prompt=custom_prompt)
             print(f"\nDEBUG: ai_source_comparables completed. {len(errors)} errors\n", flush=True)
             # Write back only the AI Comparable Price column
             comparable_idx = col_indices.get('AI Comparable Price')
@@ -257,7 +283,7 @@ def process_step(request: ProcessRequest):
             print(f"DEBUG: Processing {len(rows)} rows", flush=True)
             print(f"{'='*60}\n", flush=True)
             from process_steps import extract_final_price
-            updated_rows, errors, filled_rows = extract_final_price(rows, col_indices)
+            updated_rows, errors, filled_rows = extract_final_price(rows, col_indices, custom_prompt=custom_prompt)
             print(f"\nDEBUG: extract_final_price completed. Filled {len(filled_rows)} rows, {len(errors)} errors\n", flush=True)
             # Write back only the price column - but only update rows that were actually filled
             price_idx = col_indices.get('Price')
@@ -300,7 +326,7 @@ def process_step(request: ProcessRequest):
             print(f"DEBUG: Processing {len(rows)} rows", flush=True)
             print(f"{'='*60}\n", flush=True)
             from process_steps import ai_source_new_price
-            updated_rows, errors, filled_rows = ai_source_new_price(rows, col_indices)
+            updated_rows, errors, filled_rows = ai_source_new_price(rows, col_indices, custom_prompt=custom_prompt)
             print(f"\nDEBUG: ai_source_new_price completed. Filled {len(filled_rows)} rows, {len(errors)} errors\n", flush=True)
             # Write back only the price column - but only update rows that were actually filled
             price_idx = col_indices.get('Price')
@@ -337,6 +363,49 @@ def process_step(request: ProcessRequest):
                                 print(f"ERROR: Failed to update row {row_num}: {e}", flush=True)  # Debug log
             else:
                 print(f"DEBUG: No rows to fill. Empty rows before: {empty_before}, Filled rows: {len(filled_rows) if filled_rows else 0}", flush=True)
+        elif step == "AI Similar Comparable":
+            print(f"\n{'='*60}", flush=True)
+            print(f"DEBUG: Starting AI Similar Comparable", flush=True)
+            print(f"DEBUG: Processing {len(rows)} rows", flush=True)
+            print(f"{'='*60}\n", flush=True)
+            from process_steps import ai_similar_comparable
+            updated_rows, errors, filled_rows = ai_similar_comparable(rows, col_indices, custom_prompt=custom_prompt)
+            print(f"\nDEBUG: ai_similar_comparable completed. Filled {len(filled_rows)} rows, {len(errors)} errors\n", flush=True)
+            # Write back only the price column - but only update rows that were actually filled
+            price_idx = col_indices.get('Price')
+            filled_rows_list = filled_rows
+            
+            # Count empty price rows before processing (for stats)
+            empty_before = 0
+            if price_idx is not None:
+                for row in rows:
+                    if len(row) <= price_idx or not row[price_idx] or not str(row[price_idx]).strip():
+                        empty_before += 1
+            
+            if price_idx is not None and filled_rows:
+                col_letter = get_column_letter(price_idx)
+                print(f"DEBUG: Writing {len(filled_rows)} similar comparable prices to column {col_letter}", flush=True)
+                
+                # Update each filled row individually for accuracy
+                for row_num in filled_rows:
+                    # Convert sheet row number to array index (row 3 = index 0)
+                    array_idx = row_num - 3
+                    if 0 <= array_idx < len(updated_rows):
+                        row = updated_rows[array_idx]
+                        price_value = row[price_idx] if len(row) > price_idx else ""
+                        if price_value:  # Only update if we have a value
+                            cell_range = f"{sheet_name}!{col_letter}{row_num}" if sheet_name else f"{col_letter}{row_num}"
+                            try:
+                                update_sheet_data(sheetId, cell_range, [[price_value]])
+                                # Apply light orange color (#e2c69b) for AI Similar Comparable step
+                                from google_sheets import format_cell_color
+                                format_cell_color(sheetId, sheet_name, col_letter, row_num, '#e2c69b')
+                                print(f"DEBUG: Updated row {row_num} with similar comparable price {price_value} (light orange)", flush=True)
+                            except Exception as e:
+                                errors.append(f'Row {row_num}: Failed to write to sheet: {str(e)}')
+                                print(f"ERROR: Failed to update row {row_num}: {e}", flush=True)
+            else:
+                print(f"DEBUG: No rows to fill. Empty rows before: {empty_before}, Filled rows: {len(filled_rows) if filled_rows else 0}", flush=True)
         else:
             return {"status": "error", "detail": f"Step '{step}' not implemented."}
 
@@ -356,8 +425,8 @@ def process_step(request: ProcessRequest):
             "empty_price_rows": empty_prices
         }
         
-        # Add filled_rows if available (for Extract price and AI Source New Price steps)
-        if step in ["Extract price from AI Comparable", "AI Source New Price"] and 'filled_rows_list' in locals():
+        # Add filled_rows if available (for Extract price, AI Source New Price, and AI Similar Comparable steps)
+        if step in ["Extract price from AI Comparable", "AI Source New Price", "AI Similar Comparable"] and 'filled_rows_list' in locals():
             response_data["filled_rows"] = filled_rows_list
             # Add stats for better frontend feedback
             response_data["stats"] = {
@@ -368,6 +437,15 @@ def process_step(request: ProcessRequest):
                 "errors_count": len(errors)
             }
         
+        # Send completion update via WebSocket
+        if request.session_id:
+            await manager.broadcast_to_session(request.session_id, {
+                "type": "complete",
+                "step": step,
+                "processed": response_data.get("stats", {}).get("filled", 0) or len(response_data.get("filled_rows", [])),
+                "errors": len(errors),
+            })
+        
         print(f"DEBUG: Returning response: {response_data}", flush=True)
         return response_data
     
@@ -377,4 +455,13 @@ def process_step(request: ProcessRequest):
         print(f"❌ {error_msg}", flush=True)
         print(f"Traceback:", flush=True)
         traceback.print_exc()
+        
+        # Send error update via WebSocket
+        if request.session_id:
+            await manager.broadcast_to_session(request.session_id, {
+                "type": "error",
+                "step": request.step,
+                "message": error_msg,
+            })
+        
         raise HTTPException(status_code=500, detail=error_msg)

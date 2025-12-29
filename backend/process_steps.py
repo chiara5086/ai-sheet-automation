@@ -6,7 +6,7 @@ Contains modular functions for each process step in the asset sheet automation w
 All functions are documented and separated for clarity and maintainability.
 """
 
-def build_description(rows, col_indices):
+def build_description(rows, col_indices, custom_prompt=None):
     """
     Step 1: Build Description
     
@@ -173,12 +173,23 @@ def build_description(rows, col_indices):
         """Process a single row asynchronously."""
         i, row, row_num, asset, tech, ai_data = row_data
         
-        # Build prompt
+        # Build prompt - use custom if provided, otherwise use default
         raw_input = tech
         if ai_data:
             raw_input += f"\n\n{ai_data}"
         
-        prompt = (
+        if custom_prompt:
+            # Replace variables in custom prompt
+            prompt = custom_prompt.replace('{asset}', asset).replace('{tech_specs}', tech)
+            if ai_data:
+                prompt = prompt.replace('{ai_data}', f"\n\n{ai_data}")
+            else:
+                prompt = prompt.replace('{ai_data}', '')
+            # Remove any remaining variable placeholders if not used
+            prompt = prompt.replace('{comparable}', '')
+        else:
+            # Default prompt
+            prompt = (
             "You are a technical documentation engineer writing for an industrial machinery catalog. "
             "For each item below, generate a single, objective technical description (200–250 words).\n"
             "Rules:\n"
@@ -311,7 +322,7 @@ def build_description(rows, col_indices):
     return rows, errors
 
 
-def ai_source_comparables(rows, col_indices):
+def ai_source_comparables(rows, col_indices, custom_prompt=None):
     """
     Step 2: AI Source Comparables
     
@@ -489,8 +500,12 @@ def ai_source_comparables(rows, col_indices):
             print(f"DEBUG: Row {row_num}: Skipped - missing data (asset: {bool(asset)}, tech: {bool(tech)})")
             continue
         
-        # Build prompt matching the original GPT for Sheets format
-        prompt = f"""Search the web for this item. For each comparable listing, return ONLY: Condition, Price, and the Listing URL. No extra text. Format each on one line as: Condition: [condition], Price: [price], URL: [link]. Return up to 10 recent results.
+        # Build prompt - use custom if provided, otherwise use default
+        if custom_prompt:
+            prompt = custom_prompt.replace('{asset}', asset).replace('{tech_specs}', tech)
+            prompt = prompt.replace('{comparable}', '').replace('{ai_data}', '')
+        else:
+            prompt = f"""Search the web for this item. For each comparable listing, return ONLY: Condition, Price, and the Listing URL. No extra text. Format each on one line as: Condition: [condition], Price: [price], URL: [link]. Return up to 10 recent results.
 
 Asset: {asset}
 Technical Specifications: {tech}"""
@@ -563,7 +578,7 @@ Technical Specifications: {tech}"""
     return rows, errors
 
 
-def extract_final_price(rows, col_indices):
+def extract_final_price(rows, col_indices, custom_prompt=None):
     """
     Step 3: Extract Price from AI Comparable
     
@@ -791,16 +806,22 @@ def extract_final_price(rows, col_indices):
                 print(f"⚠️ Row {row_num}: Skipping - missing: {', '.join(missing_fields)}")
             continue  # Skip rows with missing required data
         
-        # Build prompt matching the original GPT for Sheets format
-        prompt = (
-            "You are an expert in construction equipment valuation. Read the asset details, technical specs, and comparable listings below. "
+        # Build prompt - use custom if provided, otherwise use default
+        if custom_prompt:
+            prompt = custom_prompt.replace('{asset}', asset).replace('{tech_specs}', tech).replace('{comparable}', comparable)
+            if ai_data:
+                prompt = prompt.replace('{ai_data}', f"\nAI Data:\n{ai_data}\n")
+            else:
+                prompt = prompt.replace('{ai_data}', '')
+        else:
+            prompt = (
+                "You are an expert in construction equipment valuation. Read the asset details, technical specs, and comparable listings below. "
             "Choose the single most relevant price, convert it to USD if needed, and return ONLY the final USD amount formatted like 'XXXXXX.XX'. "
             "If no relevant price exists, return blank. Do not add any explanation, note, or extra text.\n"
             f"Asset details:\n{asset}\n"
             f"Technical specifications:\n{tech}\n"
             f"Comparable listings found online:\n{comparable}\n"
         )
-        
         if ai_data:
             prompt += f"AI Data:\n{ai_data}\n"
         
@@ -906,7 +927,7 @@ def extract_final_price(rows, col_indices):
     return rows, errors, filled_rows
 
 
-def ai_source_new_price(rows, col_indices):
+def ai_source_new_price(rows, col_indices, custom_prompt=None):
     """
     Step 4: AI Source New Price
     
@@ -1111,14 +1132,22 @@ def ai_source_new_price(rows, col_indices):
             print(f"DEBUG: Row {row_num}: Skipped - missing data (asset: {bool(asset)}, tech: {bool(tech)})")
             continue
         
-        # Build prompt for brand new price search
-        prompt = f"""You are an expert in construction equipment valuation. Based ONLY on the asset details below, return the current market price of a BRAND NEW unit in USD. Return ONLY the price formatted exactly like this: 'XXXXXX.XX'. If no explicit new price is available, return blank. Do not add any words, explanations, notes, or symbols. Do not say 'blank', 'N/A', or anything else. Only output the price or nothing.
-
-Asset details: {asset}
-Technical specifications: {tech}"""
-        
-        if ai_data:
-            prompt += f"\nAdditional AI data: {ai_data}"
+        # Build prompt - use custom if provided, otherwise use default
+        if custom_prompt:
+            prompt = custom_prompt.replace('{asset}', asset).replace('{tech_specs}', tech)
+            if ai_data:
+                prompt = prompt.replace('{ai_data}', f"\nAdditional AI data: {ai_data}")
+            else:
+                prompt = prompt.replace('{ai_data}', '')
+            prompt = prompt.replace('{comparable}', '')
+        else:
+            prompt = f"""You are an expert in construction equipment valuation. Based ONLY on the asset details below, return the current market price of a BRAND NEW unit in USD. Return ONLY the price formatted exactly like this: 'XXXXXX.XX'. If no explicit new price is available, return blank. Do not add any words, explanations, notes, or symbols. Do not say 'blank', 'N/A', or anything else. Only output the price or nothing.
+Asset details:
+{asset}
+Technical specifications:
+{tech}"""
+            if ai_data:
+                prompt += f"\nAdditional AI data: {ai_data}"
         
         try:
             print(f"DEBUG: Row {row_num}: Calling API for new price search...")
@@ -1196,12 +1225,238 @@ Technical specifications: {tech}"""
     return rows, errors, filled_rows
 
 
-def ai_similar_comparable(rows, col_indices):
+def ai_similar_comparable(rows, col_indices, custom_prompt=None):
     """
     Step 5: AI Similar Comparable
-    Finds similar asset prices online if no direct comparable found (light orange cell).
+    Finds similar asset prices online based on technical specifications and AI Data.
     Fills 'Price' only for cells still empty after previous step.
     Returns updated rows and a list of errors, and a list of filled row indices.
     """
-    # TODO: Implement similar comparable logic
-    pass
+    print("DEBUG: ai_similar_comparable function called")
+    from openai import OpenAI
+    from config import OPENAI_API_KEY, PERPLEXITY_API_KEY
+    import re
+    
+    # Perplexity is preferred for web search
+    use_perplexity = False
+    api_key_clean = None
+    
+    if PERPLEXITY_API_KEY:
+        api_key_clean = PERPLEXITY_API_KEY.strip()
+        if api_key_clean.startswith('"') and api_key_clean.endswith('"'):
+            api_key_clean = api_key_clean[1:-1].strip()
+        if api_key_clean.startswith("'") and api_key_clean.endswith("'"):
+            api_key_clean = api_key_clean[1:-1].strip()
+        
+        if api_key_clean and len(api_key_clean) > 10:
+            if api_key_clean.startswith('pplx-'):
+                use_perplexity = True
+                print(f"DEBUG: Using Perplexity API for similar comparables search")
+    
+    if not use_perplexity:
+        if not OPENAI_API_KEY:
+            error_msg = 'Perplexity API key required for web search. Please set PERPLEXITY_API_KEY in your .env file.'
+            print(f"ERROR: {error_msg}")
+            return rows, [error_msg], []
+        
+        api_key_clean = OPENAI_API_KEY.strip()
+        if api_key_clean.startswith('"') and api_key_clean.endswith('"'):
+            api_key_clean = api_key_clean[1:-1].strip()
+        if api_key_clean.startswith("'") and api_key_clean.endswith("'"):
+            api_key_clean = api_key_clean[1:-1].strip()
+        
+        if not api_key_clean.startswith('sk-'):
+            match = re.search(r'sk-proj-[a-zA-Z0-9\-]{50,}', api_key_clean) or re.search(r'sk-[a-zA-Z0-9]{20,}', api_key_clean)
+            if match:
+                api_key_clean = match.group(0)
+        
+        print(f"DEBUG: Using OpenAI API (web search may be limited)")
+    
+    try:
+        if use_perplexity:
+            client = OpenAI(api_key=api_key_clean, base_url="https://api.perplexity.ai")
+        else:
+            client = OpenAI(api_key=api_key_clean)
+    except Exception as e:
+        error_msg = f'Failed to initialize API client: {str(e)}'
+        print(f"ERROR: {error_msg}")
+        return rows, [error_msg], []
+    
+    errors = []
+    filled_rows = []
+    
+    # Find column indices
+    price_idx = col_indices.get('Price')
+    asset_idx = None
+    tech_idx = col_indices.get('Technical Specifications')
+    ai_data_idx = col_indices.get('AI Data')
+    
+    # Find asset column
+    for k, idx in col_indices.items():
+        if idx is None:
+            continue
+        norm_key = ''.join(k.lower().split())
+        if 'yomoemmodel' in norm_key:
+            asset_idx = idx
+            break
+    
+    if price_idx is None or asset_idx is None or tech_idx is None:
+        error_msg = f'Missing required columns. Found: price_idx={price_idx}, asset_idx={asset_idx}, tech_idx={tech_idx}'
+        print(f"ERROR: {error_msg}")
+        return rows, [error_msg], []
+    
+    def is_price_cell_empty(row, price_idx):
+        """Check if Price cell is empty."""
+        if price_idx is None or len(row) <= price_idx:
+            return True
+        price_value = row[price_idx]
+        if price_value is None:
+            return True
+        return not str(price_value).strip()
+    
+    def safe_get_cell(row, idx):
+        """Safely extract cell value."""
+        if idx is None:
+            return ''
+        if len(row) <= idx:
+            return ''
+        value = row[idx]
+        if value is None:
+            return ''
+        return str(value).strip()
+    
+    processed_count = 0
+    skipped_empty_price = 0
+    skipped_missing_data = 0
+    
+    model_name = "sonar" if use_perplexity else "gpt-4o-mini"
+    print(f"DEBUG: Using model: {model_name}")
+    
+    for i, row in enumerate(rows):
+        if i > 0 and i % 10 == 0:
+            print(f"DEBUG: Processed {i}/{len(rows)} rows so far...")
+        row_num = i + 3
+        
+        # Only process rows where Price cell is EMPTY
+        if not is_price_cell_empty(row, price_idx):
+            skipped_empty_price += 1
+            continue
+        
+        processed_count += 1
+        
+        # Extract required data
+        asset = safe_get_cell(row, asset_idx)
+        tech = safe_get_cell(row, tech_idx)
+        ai_data = safe_get_cell(row, ai_data_idx)
+        
+        # Skip if required data is missing
+        if not asset or not tech:
+            skipped_missing_data += 1
+            print(f"DEBUG: Row {row_num}: Skipped - missing data")
+            continue
+        
+        # Build prompt - use custom if provided, otherwise use default
+        if custom_prompt:
+            prompt = custom_prompt.replace('{asset}', asset).replace('{tech_specs}', tech)
+            if ai_data:
+                prompt = prompt.replace('{ai_data}', f"\nAI Data: {ai_data}")
+            else:
+                prompt = prompt.replace('{ai_data}', '')
+            prompt = prompt.replace('{comparable}', '')
+        else:
+            prompt = f"""You are an expert in construction equipment valuation. Search for similar equipment based on the technical specifications and AI Data provided below. Find comparable assets that match the specifications and characteristics. For each similar asset found, return ONLY: Condition, Price, and the Listing URL. Format each on one line as: Condition: [condition], Price: [price], URL: [link]. Return up to 10 recent results. If no similar assets are found, return blank.
+
+Asset: {asset}
+Technical Specifications: {tech}"""
+            if ai_data:
+                prompt += f"\nAI Data: {ai_data}"
+        
+        try:
+            print(f"DEBUG: Row {row_num}: Calling API for similar comparables search...")
+            response = client.chat.completions.create(
+                model=model_name,
+                messages=[
+                    {"role": "system", "content": "You are a web search assistant. Search for similar equipment listings and return only Condition, Price, and URL for each listing, formatted as specified."},
+                    {"role": "user", "content": prompt}
+                ],
+                temperature=0.3,
+                max_tokens=1000
+            )
+            
+            similar_text = response.choices[0].message.content.strip()
+            print(f"DEBUG: Row {row_num}: API response length: {len(similar_text)} chars")
+            
+            # Extract price from the similar comparables (similar to extract_final_price logic)
+            if similar_text:
+                # Try to extract a price from the similar comparables
+                # Look for price patterns
+                price_patterns = [
+                    r'\$[\d,]+\.?\d*',
+                    r'USD\s*[\d,]+\.?\d*',
+                    r'[\d,]+\.?\d*\s*USD',
+                    r'Price:\s*\$?[\d,]+\.?\d*',
+                ]
+                
+                price_value = None
+                for pattern in price_patterns:
+                    matches = re.findall(pattern, similar_text, re.IGNORECASE)
+                    if matches:
+                        # Take the first price found
+                        price_str = matches[0]
+                        # Clean the price string
+                        price_str = re.sub(r'[^\d.]', '', price_str.replace(',', ''))
+                        try:
+                            price_value = float(price_str)
+                            break
+                        except ValueError:
+                            continue
+                
+                if price_value:
+                    # Ensure row has enough columns
+                    while len(row) <= price_idx:
+                        row.append("")
+                    
+                    row[price_idx] = f"{price_value:.2f}"
+                    filled_rows.append(row_num)
+                    print(f"✅ Row {row_num}: Successfully found similar comparable price: ${price_value:.2f}")
+                else:
+                    print(f"⚠️ Row {row_num}: Similar comparables found but no valid price extracted")
+            else:
+                print(f"⚠️ Row {row_num}: No similar comparables found")
+        
+        except Exception as e:
+            error_detail = str(e)
+            error_code = None
+            
+            if hasattr(e, 'status_code'):
+                error_code = e.status_code
+            elif hasattr(e, 'response') and hasattr(e.response, 'status_code'):
+                error_code = e.response.status_code
+            
+            if error_code in [400, 401, 429]:
+                if error_code == 401:
+                    error_msg = f"CRITICAL: API authentication failed. Please check your API key."
+                elif error_code == 400:
+                    error_msg = f"CRITICAL: Invalid API request."
+                elif error_code == 429:
+                    error_msg = f"CRITICAL: API quota exceeded."
+                else:
+                    error_msg = f"CRITICAL: API error (code {error_code})."
+                
+                print(f"❌ {error_msg}")
+                errors.append(error_msg)
+                return rows, errors, filled_rows
+            
+            error_msg = f'Row {row_num}: API error: {error_detail}'
+            errors.append(error_msg)
+            print(f"❌ {error_msg}")
+    
+    print(f"\n📊 Processing Summary:")
+    print(f"  - Total rows processed: {len(rows)}")
+    print(f"  - Rows with empty Price (candidates): {processed_count + skipped_empty_price}")
+    print(f"  - Rows skipped (already have price): {skipped_empty_price}")
+    print(f"  - Rows skipped (missing data): {skipped_missing_data}")
+    print(f"  - Rows successfully filled with price: {len(filled_rows)}")
+    print(f"  - Errors encountered: {len(errors)}")
+    
+    return rows, errors, filled_rows
