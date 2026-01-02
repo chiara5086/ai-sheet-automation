@@ -195,23 +195,23 @@ async def process_step(request: ProcessRequest):
         # Select required columns per step
         if step == "Build Description":
             required_names = [
-                r"YOM OEM Model T[234] Category",
-                r"Technical Specifications",
+                r"YOM > OEM > MODEL",  # Asset name column starts with this
+                r"Raw Trusted Data",  # Previously "Technical Specifications"
                 r"AI Data",  # Now mandatory
-                r"AI Description"
+                r"Script Technical Description"  # Previously "AI Description"
             ]
         elif step == "AI Source Comparables":
             required_names = [
-                r"YOM OEM Model",  # Will match "YOM OEM Model T3 Category" or any variation containing this
-                r"Technical Specifications",  # Exact or partial match
+                r"YOM > OEM > MODEL",  # Asset name column starts with this
+                r"Raw Trusted Data",  # Previously "Technical Specifications"
                 r"AI Comparable Price"  # Column to fill
             ]
         elif step == "Extract price from AI Comparable":
             # Required columns for price extraction - search by exact name or flexible pattern
             # We search by name, not by position, so columns can be in any order
             required_names = [
-                r"YOM OEM Model",  # Will match "YOM OEM Model T3 Category" or any variation containing this
-                r"Technical Specifications",  # Exact or partial match
+                r"YOM > OEM > MODEL",  # Asset name column starts with this
+                r"Raw Trusted Data",  # Previously "Technical Specifications"
                 r"AI Comparable Price",  # Exact or partial match
                 r"Price"  # Must be exact "Price" (not "AI Comparable Price")
             ]
@@ -220,8 +220,8 @@ async def process_step(request: ProcessRequest):
                 required_names.append(r"AI Data")
         elif step == "AI Similar Comparable":
             required_names = [
-                r"YOM OEM Model",  # Will match "YOM OEM Model T3 Category" or any variation containing this
-                r"Technical Specifications",  # Exact or partial match
+                r"YOM > OEM > MODEL",  # Asset name column starts with this
+                r"Raw Trusted Data",  # Previously "Technical Specifications"
                 r"Price"  # Column to fill
             ]
             # AI Data is optional but recommended
@@ -229,10 +229,10 @@ async def process_step(request: ProcessRequest):
                 required_names.append(r"AI Data")
         else:
             required_names = [
-                r"YOM OEM Model T[234] Category",
-                r"Technical Specifications",
+                r"YOM > OEM > MODEL",  # Asset name column starts with this
+                r"Raw Trusted Data",  # Previously "Technical Specifications"
                 r"AI Data",
-                r"AI Description",
+                r"Script Technical Description",  # Previously "AI Description"
                 r"AI Comparable Price",
                 r"Price"
             ]
@@ -265,7 +265,7 @@ async def process_step(request: ProcessRequest):
         
         if step == "Build Description":
             # Count rows that were already filled before processing
-            desc_idx = col_indices.get('AI Description')
+            desc_idx = col_indices.get('Script Technical Description')
             already_filled_count = 0
             if desc_idx is not None:
                 for row in rows:
@@ -311,8 +311,45 @@ async def process_step(request: ProcessRequest):
             print(f"DEBUG: Processing {len(rows)} rows", flush=True)
             print(f"{'='*60}\n", flush=True)
             from process_steps import ai_source_comparables
-            updated_rows, errors = ai_source_comparables(rows, col_indices, custom_prompt=custom_prompt)
+            updated_rows, errors, comparables_stats = ai_source_comparables(rows, col_indices, custom_prompt=custom_prompt, session_id=request.session_id)
             print(f"\nDEBUG: ai_source_comparables completed. {len(errors)} errors\n", flush=True)
+            # Store stats for response BEFORE writing to sheet (so we can send WebSocket message early)
+            comparables_stats_dict = comparables_stats
+            
+            # Send WebSocket complete message EARLY, before writing to sheet
+            # This ensures the message is sent while WebSocket connections are still open
+            if request.session_id and comparables_stats_dict:
+                stats = comparables_stats_dict
+                filled = stats.get("success", 0)
+                errors_count = stats.get("errors_count", 0)
+                skipped = stats.get("skipped", 0)
+                
+                complete_message = {
+                    "type": "complete",
+                    "step": step,
+                    "total": len(rows),
+                    "processed": filled,
+                    "success": filled,
+                    "errors": errors_count,
+                    "skipped": skipped,
+                }
+                print(f"DEBUG: Sending WebSocket complete message EARLY to session {request.session_id}: {complete_message}", flush=True)
+                has_connection = manager.has_active_connection(request.session_id)
+                print(f"DEBUG: Active connections for session {request.session_id}: {has_connection}", flush=True)
+                
+                if has_connection:
+                    try:
+                        import asyncio
+                        await asyncio.sleep(0.1)
+                        await manager.broadcast_to_session(request.session_id, complete_message)
+                        print(f"DEBUG: WebSocket complete message sent successfully (early)", flush=True)
+                    except Exception as e:
+                        print(f"ERROR: Failed to send WebSocket complete message (early): {e}", flush=True)
+                        import traceback
+                        traceback.print_exc()
+                else:
+                    print(f"WARNING: No active WebSocket connections for session {request.session_id} (early send), message not sent", flush=True)
+            
             # Write back only the AI Comparable Price column
             comparable_idx = col_indices.get('AI Comparable Price')
             if comparable_idx is not None:
@@ -474,6 +511,8 @@ async def process_step(request: ProcessRequest):
         # Add stats based on step type
         if step == "Build Description" and 'build_description_stats' in locals():
             response_data["stats"] = build_description_stats
+        elif step == "AI Source Comparables" and 'comparables_stats_dict' in locals():
+            response_data["stats"] = comparables_stats_dict
         elif step in ["Extract price from AI Comparable", "AI Source New Price", "AI Similar Comparable"] and 'filled_rows_list' in locals():
             response_data["filled_rows"] = filled_rows_list
             # Add stats for better frontend feedback
@@ -486,7 +525,9 @@ async def process_step(request: ProcessRequest):
             }
         
         # Send completion update via WebSocket with final stats
-        if request.session_id:
+        # NOTE: For "AI Source Comparables", the message is already sent early (before writing to sheet)
+        # For other steps, send it here
+        if request.session_id and step != "AI Source Comparables":
             stats = response_data.get("stats", {})
             # Calculate skipped: rows that were already filled before processing
             # For Build Description: skipped = total - filled (newly filled) - errors
@@ -510,13 +551,23 @@ async def process_step(request: ProcessRequest):
                 "skipped": skipped,
             }
             print(f"DEBUG: Sending WebSocket complete message to session {request.session_id}: {complete_message}", flush=True)
-            try:
-                await manager.broadcast_to_session(request.session_id, complete_message)
-                print(f"DEBUG: WebSocket complete message sent successfully", flush=True)
-            except Exception as e:
-                print(f"ERROR: Failed to send WebSocket complete message: {e}", flush=True)
-                import traceback
-                traceback.print_exc()
+            # Check if there are active connections before sending
+            has_connection = manager.has_active_connection(request.session_id)
+            print(f"DEBUG: Active connections for session {request.session_id}: {has_connection}", flush=True)
+            
+            if has_connection:
+                try:
+                    # Small delay to ensure WebSocket is ready
+                    import asyncio
+                    await asyncio.sleep(0.1)
+                    await manager.broadcast_to_session(request.session_id, complete_message)
+                    print(f"DEBUG: WebSocket complete message sent successfully", flush=True)
+                except Exception as e:
+                    print(f"ERROR: Failed to send WebSocket complete message: {e}", flush=True)
+                    import traceback
+                    traceback.print_exc()
+            else:
+                print(f"WARNING: No active WebSocket connections for session {request.session_id}, message not sent", flush=True)
         else:
             print(f"WARNING: No session_id provided, skipping WebSocket complete message", flush=True)
         
@@ -613,6 +664,22 @@ async def get_history_grouped_endpoint():
     except Exception as e:
         import traceback
         error_msg = f"Error retrieving grouped history: {str(e)}"
+        print(f"❌ {error_msg}", flush=True)
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=error_msg)
+
+@router.delete("/history")
+async def clear_history_endpoint():
+    """
+    Clear all history records (use with caution)
+    """
+    try:
+        from database import clear_history
+        await clear_history()
+        return {"status": "ok", "message": "History cleared successfully"}
+    except Exception as e:
+        import traceback
+        error_msg = f"Error clearing history: {str(e)}"
         print(f"❌ {error_msg}", flush=True)
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=error_msg)

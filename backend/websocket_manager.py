@@ -60,11 +60,19 @@ class ConnectionManager:
     async def broadcast_to_session(self, session_id: str, message: dict):
         if session_id in self.active_connections:
             disconnected = set()
-            for connection in self.active_connections[session_id]:
+            sent_count = 0
+            for connection in list(self.active_connections[session_id]):  # Use list to avoid modification during iteration
                 try:
-                    await connection.send_json(message)
+                    # Check if connection is still open
+                    if connection.client_state.name == 'CONNECTED':
+                        await connection.send_json(message)
+                        sent_count += 1
+                        print(f"DEBUG: Sent message to WebSocket connection (session: {session_id})", flush=True)
+                    else:
+                        print(f"DEBUG: WebSocket connection is not CONNECTED (state: {connection.client_state.name})", flush=True)
+                        disconnected.add(connection)
                 except Exception as e:
-                    print(f"Error broadcasting to connection: {e}")
+                    print(f"ERROR: Error broadcasting to connection: {e}", flush=True)
                     disconnected.add(connection)
             
             # Remove disconnected connections
@@ -72,6 +80,10 @@ class ConnectionManager:
                 self.active_connections[session_id].discard(connection)
             if not self.active_connections[session_id]:
                 del self.active_connections[session_id]
+            
+            print(f"DEBUG: Broadcast complete - sent to {sent_count} connection(s), removed {len(disconnected)} disconnected", flush=True)
+        else:
+            print(f"DEBUG: No active connections found for session {session_id}", flush=True)
 
 manager = ConnectionManager()
 

@@ -10,6 +10,7 @@ import MonitorIcon from '@mui/icons-material/Monitor';
 import DetailedProgressMonitor from '../components/DetailedProgressMonitor';
 import NavigationBar from '../components/NavigationBar';
 import { saveHistory } from '../api';
+import { useNotificationContext } from '../context/NotificationContext';
 
 /**
  * Monitor page - Shows detailed progress for all active and completed processes
@@ -17,6 +18,7 @@ import { saveHistory } from '../api';
  * Uses localStorage and events (not shared database)
  */
 export default function Monitor() {
+  const { notifications, markAllAsRead, clearNotifications, markAsRead } = useNotificationContext();
   // State for multiple processes
   const [processes, setProcesses] = useState({}); // { processId: { stepName, stats, elapsedTime, isCompleted, isActive, startTime, sessionId, progress, sheetName } }
   const processTimersRef = useRef({}); // { processId: timerId }
@@ -90,6 +92,101 @@ export default function Monitor() {
 
   // Listen for new processes from Home page via custom event and localStorage
   useEffect(() => {
+    console.log('👂 Monitor: Setting up event listeners (processCompleted, newProcess, storage)');
+    
+    // Listen for process completion from Home
+    const handleProcessCompleted = (e) => {
+      console.log(`📨 Monitor: processCompleted event received:`, e.detail);
+      const { processId, stats, elapsedTime, stepName, sheetName } = e.detail || {};
+      if (!processId) {
+        console.warn('⚠️ Monitor: processCompleted event missing processId');
+        return;
+      }
+      console.log(`🔄 Monitor: Received processCompleted event for ${processId} from Home`);
+      
+      setProcesses(prev => {
+        const process = prev[processId];
+        if (!process) {
+          console.warn(`⚠️ Monitor: Process ${processId} not found for completion sync`);
+          return prev;
+        }
+        
+        if (process.isCompleted) {
+          console.log(`⚠️ Monitor: Process ${processId} already marked as completed`);
+          return prev;
+        }
+        
+        console.log(`✅ Monitor: Syncing completion from Home for process ${processId}`);
+        
+        // Stop timer
+        if (processTimersRef.current[processId]) {
+          clearInterval(processTimersRef.current[processId]);
+          delete processTimersRef.current[processId];
+        }
+        
+        // Calculate initialEmptyRows if needed
+        let finalInitialEmptyRows = process.stats.initialEmptyRows;
+        if (finalInitialEmptyRows === 0) {
+          if (stepName === "Build Description" && stats.skipped > 0) {
+            finalInitialEmptyRows = stats.total - stats.skipped;
+            console.log(`📊 Monitor: Calculated initialEmptyRows for Build Description: ${finalInitialEmptyRows} (total: ${stats.total}, skipped: ${stats.skipped})`);
+          } else if (stepName === "AI Source Comparables") {
+            // For AI Source Comparables, initialEmptyRows = success (the rows that were filled)
+            finalInitialEmptyRows = stats.success || 0;
+            console.log(`📊 Monitor: Calculated initialEmptyRows for AI Source Comparables: ${finalInitialEmptyRows} (success: ${stats.success})`);
+          }
+        }
+        
+        const updatedProcess = {
+          ...process,
+          isActive: false,
+          isCompleted: true,
+          elapsedTime: elapsedTime,
+          stats: {
+            total: stats.total,
+            processed: stats.processed || stats.success || 0,
+            success: stats.success || 0,
+            errors: stats.errors || 0,
+            skipped: stats.skipped || 0,
+            initialEmptyRows: finalInitialEmptyRows,
+          },
+          progress: 100,
+        };
+        
+        // Save to history if not already saved
+        if (!historySavedRef.current[processId]) {
+          historySavedRef.current[processId] = true;
+          setTimeout(() => {
+            const formatTime = (seconds) => {
+              const mins = Math.floor(seconds / 60);
+              const secs = seconds % 60;
+              return `${mins.toString().padStart(2, '0')}:${secs.toString().padStart(2, '0')}`;
+            };
+            
+            saveHistory(
+              sheetName || process.sheetName || 'Unknown Sheet',
+              stepName || process.stepName,
+              `Step '${stepName || process.stepName}' completed in ${formatTime(elapsedTime)}. Filled ${stats.success || 0} row(s).`,
+              new Date().toISOString(),
+              new Date().toLocaleTimeString()
+            ).then((result) => {
+              console.log('✅ Monitor: History saved successfully (from Home completion)');
+              window.dispatchEvent(new CustomEvent('historyUpdated'));
+            }).catch((err) => {
+              console.error('❌ Monitor: Failed to save history:', err);
+            });
+          }, 100);
+        }
+        
+        return {
+          ...prev,
+          [processId]: updatedProcess,
+        };
+      });
+    };
+    
+    window.addEventListener('processCompleted', handleProcessCompleted);
+    
     const handleStorageChange = (e) => {
       if (e.key === 'newProcess') {
         try {
@@ -141,6 +238,8 @@ export default function Monitor() {
 
     window.addEventListener('storage', handleStorageChange);
     window.addEventListener('newProcess', handleCustomEvent);
+    window.addEventListener('processCompleted', handleProcessCompleted);
+    console.log('✅ Monitor: Event listeners registered');
     
     // Also check localStorage periodically (for same-window communication)
     const checkForNewProcess = setInterval(() => {
@@ -154,31 +253,98 @@ export default function Monitor() {
           console.error('Error parsing new process:', err);
         }
       }
-      // Also sync homeProcesses for same-window communication (only add NEW processes)
+      // Also sync homeProcesses for same-window communication
+      // This handles both NEW processes and COMPLETION status updates
       const homeProcessesData = localStorage.getItem('homeProcesses');
       if (homeProcessesData) {
         try {
           const updatedProcesses = JSON.parse(homeProcessesData);
           setProcesses(prev => {
             const merged = { ...prev };
-            // Only add NEW processes, don't update existing ones
             Object.keys(updatedProcesses).forEach(processId => {
-              if (!merged[processId]) {
+              const homeProcess = updatedProcesses[processId];
+              const monitorProcess = merged[processId];
+              
+              if (!monitorProcess) {
                 // Add new process from Home
-                merged[processId] = updatedProcesses[processId];
-                if (updatedProcesses[processId].isActive && updatedProcesses[processId].startTime) {
-                  startTimer(processId, updatedProcesses[processId].startTime);
+                merged[processId] = homeProcess;
+                if (homeProcess.isActive && homeProcess.startTime) {
+                  startTimer(processId, homeProcess.startTime);
                 }
-                if (updatedProcesses[processId].isActive && updatedProcesses[processId].sessionId) {
-                  connectWebSocket(processId, updatedProcesses[processId].sessionId);
+                if (homeProcess.isActive && homeProcess.sessionId) {
+                  connectWebSocket(processId, homeProcess.sessionId);
+                }
+              } else if (homeProcess.isCompleted && !monitorProcess.isCompleted) {
+                // Home says it's completed but Monitor doesn't - sync completion
+                console.log(`🔄 Monitor: Syncing completion for ${processId} from homeProcesses (interval check)`);
+                
+                // Stop timer
+                if (processTimersRef.current[processId]) {
+                  clearInterval(processTimersRef.current[processId]);
+                  delete processTimersRef.current[processId];
+                }
+                
+                // Calculate initialEmptyRows if needed
+                let finalInitialEmptyRows = monitorProcess.stats?.initialEmptyRows || 0;
+                if (finalInitialEmptyRows === 0) {
+                  const stepName = homeProcess.stepName || monitorProcess.stepName;
+                  const stats = homeProcess.stats || {};
+                  if (stepName === "Build Description" && stats.skipped > 0) {
+                    finalInitialEmptyRows = stats.total - stats.skipped;
+                    console.log(`📊 Monitor: Calculated initialEmptyRows for Build Description: ${finalInitialEmptyRows}`);
+                  } else if (stepName === "AI Source Comparables") {
+                    finalInitialEmptyRows = stats.success || 0;
+                    console.log(`📊 Monitor: Calculated initialEmptyRows for AI Source Comparables: ${finalInitialEmptyRows}`);
+                  }
+                }
+                
+                merged[processId] = {
+                  ...monitorProcess,
+                  ...homeProcess,
+                  isActive: false,
+                  isCompleted: true,
+                  stats: {
+                    ...homeProcess.stats,
+                    initialEmptyRows: finalInitialEmptyRows,
+                  },
+                  progress: 100,
+                };
+                
+                // Save to history if not already saved
+                if (!historySavedRef.current[processId]) {
+                  historySavedRef.current[processId] = true;
+                  setTimeout(() => {
+                    const formatTime = (seconds) => {
+                      const mins = Math.floor(seconds / 60);
+                      const secs = seconds % 60;
+                      return `${mins.toString().padStart(2, '0')}:${secs.toString().padStart(2, '0')}`;
+                    };
+                    
+                    const sheetNameToSave = homeProcess.sheetName || monitorProcess.sheetName || 'Unknown Sheet';
+                    const stepToSave = homeProcess.stepName || monitorProcess.stepName;
+                    const successCount = homeProcess.stats?.success || 0;
+                    const elapsedTimeToSave = homeProcess.elapsedTime || 0;
+                    
+                    saveHistory(
+                      sheetNameToSave,
+                      stepToSave,
+                      `Step '${stepToSave}' completed in ${formatTime(elapsedTimeToSave)}. Filled ${successCount} row(s).`,
+                      new Date().toISOString(),
+                      new Date().toLocaleTimeString()
+                    ).then(() => {
+                      console.log('✅ Monitor: History saved successfully (from homeProcesses sync)');
+                      window.dispatchEvent(new CustomEvent('historyUpdated'));
+                    }).catch((err) => {
+                      console.error('❌ Monitor: Failed to save history:', err);
+                    });
+                  }, 100);
                 }
               }
-              // Note: We intentionally don't update existing processes here
             });
             return merged;
           });
         } catch (err) {
-          console.error('Error syncing new processes from Home:', err);
+          console.error('Error syncing processes from Home:', err);
         }
       }
     }, 500);
@@ -186,6 +352,7 @@ export default function Monitor() {
     return () => {
       window.removeEventListener('storage', handleStorageChange);
       window.removeEventListener('newProcess', handleCustomEvent);
+      window.removeEventListener('processCompleted', handleProcessCompleted);
       clearInterval(checkForNewProcess);
     };
   }, []);
@@ -687,7 +854,12 @@ export default function Monitor() {
 
   return (
     <>
-      <NavigationBar />
+      <NavigationBar
+        notifications={notifications}
+        onClearNotifications={clearNotifications}
+        onMarkAllRead={markAllAsRead}
+        onMarkAsRead={markAsRead}
+      />
 
       <Box sx={{ background: '#f5f5f5', minHeight: '100vh', pt: '80px', pb: 4 }}>
         <Container maxWidth="xl">

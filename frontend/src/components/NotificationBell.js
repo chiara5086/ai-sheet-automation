@@ -17,7 +17,12 @@ import CheckCircleIcon from '@mui/icons-material/CheckCircle';
 import ErrorIcon from '@mui/icons-material/Error';
 import InfoIcon from '@mui/icons-material/Info';
 
-export default function NotificationBell({ notifications, onClearAll }) {
+export default function NotificationBell({ 
+  notifications, 
+  onClearAll, 
+  onMarkAllRead,
+  onMarkAsRead 
+}) {
   const [anchorEl, setAnchorEl] = useState(null);
   const open = Boolean(anchorEl);
 
@@ -84,10 +89,44 @@ export default function NotificationBell({ notifications, onClearAll }) {
           },
         }}
       >
-        <Box sx={{ p: 2, pb: 1 }}>
+        <Box sx={{ p: 2, pb: 1, display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
           <Typography variant="h6" sx={{ fontWeight: 600 }}>
             Notifications
           </Typography>
+          {notifications.length > 0 && (
+            <Box sx={{ display: 'flex', gap: 1 }}>
+              {unreadCount > 0 && onMarkAllRead && (
+                <Button
+                  size="small"
+                  onClick={onMarkAllRead}
+                  sx={{
+                    textTransform: 'none',
+                    fontSize: '0.75rem',
+                    color: '#1976d2',
+                    minWidth: 'auto',
+                    px: 1,
+                  }}
+                >
+                  Mark all read
+                </Button>
+              )}
+              {onClearAll && (
+                <Button
+                  size="small"
+                  onClick={onClearAll}
+                  sx={{
+                    textTransform: 'none',
+                    fontSize: '0.75rem',
+                    color: '#d32f2f',
+                    minWidth: 'auto',
+                    px: 1,
+                  }}
+                >
+                  Clear
+                </Button>
+              )}
+            </Box>
+          )}
         </Box>
         <Divider />
         <List sx={{ maxHeight: 400, overflow: 'auto', p: 0 }}>
@@ -104,11 +143,13 @@ export default function NotificationBell({ notifications, onClearAll }) {
           ) : (
             notifications.map((notification, idx) => (
               <ListItem
-                key={idx}
+                key={notification.id || idx}
+                onClick={() => !notification.read && onMarkAsRead && onMarkAsRead(notification.id)}
                 sx={{
                   backgroundColor: notification.read ? 'transparent' : '#f5f5f5',
+                  cursor: !notification.read && onMarkAsRead ? 'pointer' : 'default',
                   '&:hover': {
-                    backgroundColor: '#fafafa',
+                    backgroundColor: notification.read ? '#fafafa' : '#eeeeee',
                   },
                 }}
               >
@@ -133,16 +174,6 @@ export default function NotificationBell({ notifications, onClearAll }) {
             ))
           )}
         </List>
-        {notifications.length > 0 && (
-          <>
-            <Divider />
-            <Box sx={{ p: 1.5, display: 'flex', justifyContent: 'flex-end' }}>
-              <Button size="small" onClick={onClearAll}>
-                Clear All
-              </Button>
-            </Box>
-          </>
-        )}
       </Popover>
     </>
   );

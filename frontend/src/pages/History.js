@@ -13,18 +13,23 @@ import {
   Divider,
 } from '@mui/material';
 import NavigationBar from '../components/NavigationBar';
+import { useNotificationContext } from '../context/NotificationContext';
 import HistoryIcon from '@mui/icons-material/History';
 import CheckCircleIcon from '@mui/icons-material/CheckCircle';
 import ErrorIcon from '@mui/icons-material/Error';
 import InfoIcon from '@mui/icons-material/Info';
 import RefreshIcon from '@mui/icons-material/Refresh';
-import { IconButton, CircularProgress } from '@mui/material';
-import { getHistoryGrouped } from '../api';
+import DeleteIcon from '@mui/icons-material/Delete';
+import { IconButton, CircularProgress, Button, Dialog, DialogTitle, DialogContent, DialogContentText, DialogActions } from '@mui/material';
+import { getHistoryGrouped, clearHistory } from '../api';
 
 export default function History() {
+  const { notifications, markAllAsRead, clearNotifications, markAsRead } = useNotificationContext();
   const [history, setHistory] = useState([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(null);
+  const [clearDialogOpen, setClearDialogOpen] = useState(false);
+  const [clearing, setClearing] = useState(false);
 
   const loadHistory = async () => {
     try {
@@ -157,6 +162,24 @@ export default function History() {
     return 'info';
   };
 
+  const handleClearHistory = async () => {
+    setClearing(true);
+    try {
+      await clearHistory();
+      console.log('✅ History cleared successfully');
+      // Clear localStorage fallback too
+      localStorage.removeItem('sheetHistory');
+      // Reload history (will be empty now)
+      await loadHistory();
+      setClearDialogOpen(false);
+    } catch (err) {
+      console.error('❌ Error clearing history:', err);
+      setError(err.message || 'Failed to clear history');
+    } finally {
+      setClearing(false);
+    }
+  };
+
   // Group history by sheet
   const groupedHistory = history.reduce((acc, item) => {
     const sheetName = item.sheetName || item.sheet_name || 'Unknown Sheet';
@@ -169,7 +192,12 @@ export default function History() {
 
   return (
     <>
-      <NavigationBar />
+      <NavigationBar
+        notifications={notifications}
+        onClearNotifications={clearNotifications}
+        onMarkAllRead={markAllAsRead}
+        onMarkAsRead={markAsRead}
+      />
       <Box sx={{ background: '#f5f5f5', minHeight: '100vh', pt: '80px', pb: 4 }}>
         <Container maxWidth="xl">
           <Box sx={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', mb: 4 }}>
@@ -179,14 +207,35 @@ export default function History() {
                 Sheet Processing History
               </Typography>
             </Box>
-            <IconButton
-              onClick={loadHistory}
-              disabled={loading}
-              sx={{ color: '#1a2746' }}
-              title="Refresh history"
-            >
-              {loading ? <CircularProgress size={24} /> : <RefreshIcon />}
-            </IconButton>
+            <Box sx={{ display: 'flex', alignItems: 'center', gap: 1 }}>
+              <IconButton
+                onClick={loadHistory}
+                disabled={loading}
+                sx={{ color: '#1a2746' }}
+                title="Refresh history"
+              >
+                {loading ? <CircularProgress size={24} /> : <RefreshIcon />}
+              </IconButton>
+              {history.length > 0 && (
+                <Button
+                  variant="outlined"
+                  color="error"
+                  startIcon={<DeleteIcon />}
+                  onClick={() => setClearDialogOpen(true)}
+                  sx={{
+                    textTransform: 'none',
+                    borderColor: '#d32f2f',
+                    color: '#d32f2f',
+                    '&:hover': {
+                      borderColor: '#c62828',
+                      backgroundColor: 'rgba(211, 47, 47, 0.04)',
+                    },
+                  }}
+                >
+                  Clear History
+                </Button>
+              )}
+            </Box>
           </Box>
 
         {loading ? (
@@ -290,6 +339,43 @@ export default function History() {
             </Card>
           ))
         )}
+
+        {/* Clear History Confirmation Dialog */}
+        <Dialog
+          open={clearDialogOpen}
+          onClose={() => !clearing && setClearDialogOpen(false)}
+          aria-labelledby="clear-history-dialog-title"
+          aria-describedby="clear-history-dialog-description"
+        >
+          <DialogTitle id="clear-history-dialog-title">
+            Clear All History?
+          </DialogTitle>
+          <DialogContent>
+            <DialogContentText id="clear-history-dialog-description">
+              Are you sure you want to delete all history records? This action cannot be undone.
+              All processing history will be permanently removed.
+            </DialogContentText>
+          </DialogContent>
+          <DialogActions>
+            <Button
+              onClick={() => setClearDialogOpen(false)}
+              disabled={clearing}
+              sx={{ textTransform: 'none' }}
+            >
+              Cancel
+            </Button>
+            <Button
+              onClick={handleClearHistory}
+              color="error"
+              variant="contained"
+              disabled={clearing}
+              startIcon={clearing ? <CircularProgress size={16} /> : <DeleteIcon />}
+              sx={{ textTransform: 'none' }}
+            >
+              {clearing ? 'Clearing...' : 'Clear All History'}
+            </Button>
+          </DialogActions>
+        </Dialog>
         </Container>
       </Box>
     </>

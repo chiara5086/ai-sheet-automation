@@ -11,10 +11,10 @@ import InfoIcon from '@mui/icons-material/Info';
 import WarningIcon from '@mui/icons-material/Warning';
 
 const REQUIRED_COLUMNS = [
-  { name: 'YOM OEM Model', description: 'Asset name or title (column name must start with this)' },
-  { name: 'Technical Specifications', description: 'Raw data containing technical specifications' },
+  { name: 'YOM > OEM > MODEL', description: 'Asset name or title (column name must start with this)' },
+  { name: 'Raw Trusted Data', description: 'Raw data containing technical specifications' },
   { name: 'AI Data', description: 'Additional AI-generated structured data and specifications' },
-  { name: 'AI Description', description: 'Technical description generated with AI' },
+  { name: 'Script Technical Description', description: 'Technical description generated with AI' },
   { name: 'AI Comparable Price', description: 'AI-sourced comparable listings and prices found online' },
   { name: 'Price', description: 'Final extracted price value' },
 ];

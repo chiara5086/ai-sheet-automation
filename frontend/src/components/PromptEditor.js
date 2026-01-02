@@ -34,27 +34,35 @@ Raw input:
 {tech_specs}
 {ai_data}`,
 
-  'AI Source Comparables': `Search the web for this item. For each comparable listing, return ONLY: Condition, Price, and the Listing URL. No extra text. Format each on one line as: Condition: [condition], Price: [price], URL: [link]. Return up to 10 recent results.
+  'AI Source Comparables': `You are an expert in construction equipment valuation. Search the web thoroughly for comparable listings of this equipment. You MUST find and return at least 3-10 comparable listings if they exist online. For each comparable listing found, return ONLY: Condition, Price, and the Listing URL. Format each listing on one line exactly as: Condition: [condition], Price: [price], URL: [link]. 
+
+IMPORTANT: 
+- Search multiple equipment marketplaces (Machinery Pete, IronPlanet, eBay, Equipment Trader, etc.)
+- Return up to 10 recent results if available
+- If a listing doesn't have a price, use "Not listed" or "Call for Price" as the price
+- Only return listings that are actually for sale (not just specifications pages)
+- If you cannot find any comparables after thorough searching, return a brief explanation
 
 Asset: {asset}
-Technical Specifications: {tech_specs}`,
+Raw Trusted Data: {tech_specs}
+{ai_data}`,
 
   'Extract price from AI Comparable': `You are an expert in construction equipment valuation. Read the asset details, technical specs, and comparable listings below. Choose the single most relevant price, convert it to USD if needed, and return ONLY the final USD amount formatted like 'XXXXXX.XX'. If no relevant price exists, return blank. Do not add any explanation, note, or extra text.
 Asset details: {asset}
-Technical specifications: {tech_specs}
+Raw Trusted Data: {tech_specs}
 Comparable listings found online: {comparable}
 {ai_data}`,
 
   'AI Source New Price': `You are an expert in construction equipment valuation. Based ONLY on the asset details below, return the current market price of a BRAND NEW unit in USD. Return ONLY the price formatted exactly like this: 'XXXXXX.XX'. If no explicit new price is available, return blank. Do not add any words, explanations, notes, or symbols. Do not say 'blank', 'N/A', or anything else. Only output the price or nothing.
 Asset details:
 {asset}
-Technical specifications:
+Raw Trusted Data:
 {tech_specs}`,
 
-  'AI Similar Comparable': `You are an expert in construction equipment valuation. Search for similar equipment based on the technical specifications and AI Data provided below. Find comparable assets that match the specifications and characteristics. For each similar asset found, return ONLY: Condition, Price, and the Listing URL. Format each on one line as: Condition: [condition], Price: [price], URL: [link]. Return up to 10 recent results. If no similar assets are found, return blank.
+  'AI Similar Comparable': `You are an expert in construction equipment valuation. Search for similar equipment based on the Raw Trusted Data and AI Data provided below. Find comparable assets that match the specifications and characteristics. For each similar asset found, return ONLY: Condition, Price, and the Listing URL. Format each on one line as: Condition: [condition], Price: [price], URL: [link]. Return up to 10 recent results. If no similar assets are found, return blank.
 
 Asset: {asset}
-Technical Specifications: {tech_specs}
+Raw Trusted Data: {tech_specs}
 AI Data: {ai_data}`,
 };
 

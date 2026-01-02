@@ -18,7 +18,8 @@ import NavigationBar from '../components/NavigationBar';
 import StepSelector from '../components/StepSelector';
 import InstructionsCard from '../components/InstructionsCard';
 import { DEFAULT_PROMPTS } from '../components/PromptEditor';
-import { fetchSheetPreview, runProcessStep } from '../api';
+import { fetchSheetPreview, runProcessStep, saveHistory } from '../api';
+import { useNotificationContext } from '../context/NotificationContext';
 
 const STEPS = [
   { id: 1, name: 'Build Description', color: '#1a2746' },
@@ -29,12 +30,12 @@ const STEPS = [
 ];
 
 export default function Home() {
+  const { notifications, addNotification, markAllAsRead, clearNotifications, markAsRead } = useNotificationContext();
   const [sheetUrl, setSheetUrl] = useState('');
   const [sheetHeaders, setSheetHeaders] = useState([]);
   const [sheetRows, setSheetRows] = useState([]);
   const [sheetName, setSheetName] = useState(null);
   const [priceStepMap, setPriceStepMap] = useState({});
-  const [notifications, setNotifications] = useState([]);
   const [snackbar, setSnackbar] = useState({ open: false, message: '', severity: 'info' });
 
   // Multiple processes state - each process has its own progress bar
@@ -228,6 +229,12 @@ export default function Home() {
               if (process.completionTimeout) {
                 clearTimeout(process.completionTimeout);
                 console.log(`⏰ Cancelled auto-completion timeout for ${processId}`);
+              }
+              
+              // Cancel fallback timeout if it exists
+              if (process.fallbackTimeoutId) {
+                clearTimeout(process.fallbackTimeoutId);
+                console.log(`⏰ Cancelled fallback timeout for ${processId}`);
               }
               
               // Calculate elapsed time using the process's startTime
@@ -570,24 +577,8 @@ export default function Home() {
     };
   }, []);
 
-  const addNotification = (type, title, message) => {
-    const notification = {
-      id: Date.now(),
-      type,
-      title,
-      message,
-      time: new Date().toLocaleTimeString(),
-      read: false,
-    };
-    setNotifications((prev) => [notification, ...prev]);
-  };
-
   const showSnackbar = (message, severity = 'info') => {
     setSnackbar({ open: true, message, severity });
-  };
-
-  const handleClearNotifications = () => {
-    setNotifications([]);
   };
 
   const handleSavePrompt = (stepName, prompt) => {
@@ -616,15 +607,18 @@ export default function Home() {
       addNotification('info', 'Sheet loaded', `${res.data.sheet_name || 'Sheet'} loaded with ${res.data.rows.length} rows`);
       
       // Save to history using API
+      console.log('💾 Home: Saving sheet load to history...');
       saveHistory(
         res.data.sheet_name || 'Unknown Sheet',
         null, // No step for sheet loading
         `Sheet loaded: ${res.data.sheet_name || 'default tab'} with ${res.data.headers.length} columns and ${res.data.rows.length} rows`,
         new Date().toISOString(),
         new Date().toLocaleTimeString()
-      ).then(() => {
+      ).then((result) => {
+        console.log('✅ Home: Sheet load history saved successfully:', result);
         // Notify History page to refresh
         window.dispatchEvent(new CustomEvent('historyUpdated'));
+        console.log('📢 Home: Dispatched historyUpdated event for sheet load');
       }).catch((err) => {
         console.error('Failed to save history to database:', err);
         // Fallback to localStorage if API fails
@@ -686,7 +680,7 @@ export default function Home() {
     let initialEmptyRows = 0;
     if (stepName === "Build Description" && sheetRows.length > 0) {
       const descHeaderIndex = sheetHeaders.findIndex(h => 
-        h && h.toLowerCase().includes('ai description')
+        h && h.toLowerCase().includes('script technical description')
       );
       if (descHeaderIndex >= 0) {
         initialEmptyRows = sheetRows.filter(row => {
@@ -695,7 +689,7 @@ export default function Home() {
         }).length;
         console.log(`📊 Home: Calculated initialEmptyRows: ${initialEmptyRows} for step "${stepName}"`);
       } else {
-        console.warn(`⚠️ Home: Could not find 'AI Description' column for calculating initialEmptyRows`);
+        console.warn(`⚠️ Home: Could not find 'Script Technical Description' column for calculating initialEmptyRows`);
       }
     } else {
       console.log(`📊 Home: Skipping initialEmptyRows calculation (stepName: "${stepName}", sheetRows.length: ${sheetRows.length})`);
@@ -767,6 +761,178 @@ export default function Home() {
       const errors = res.data?.errors || [];
       const filledRows = res.data?.filled_rows || [];
       const stats = res.data?.stats || {};
+      
+      // Immediately update progress with stats from HTTP response
+      // This ensures the UI shows progress even if WebSocket messages don't arrive
+      // If the process is complete (all rows processed), mark as completed immediately
+      setProcesses(prev => {
+        const process = prev[processId];
+        if (process && stats.total) {
+          const updatedStats = {
+            total: stats.total || process.stats.total || 0,
+            processed: stats.processed || stats.success || process.stats.processed || 0,
+            success: stats.success || stats.processed || process.stats.success || 0,
+            errors: stats.errors_count || stats.errors || process.stats.errors || 0,
+            skipped: stats.skipped || process.stats.skipped || 0,
+            initialEmptyRows: process.stats.initialEmptyRows || 0,
+          };
+          
+          const progress = updatedStats.total > 0 
+            ? ((updatedStats.success + updatedStats.skipped) / updatedStats.total) * 100 
+            : 100;
+          
+          // Check if process is complete: if success + skipped = total, it's done
+          // For AI Source Comparables, the process is complete when all empty rows are filled
+          const isComplete = updatedStats.total > 0 && 
+            (updatedStats.success + updatedStats.skipped + updatedStats.errors) >= updatedStats.total;
+          
+          console.log(`📊 Home: Updating progress from HTTP response:`, {
+            processId,
+            rawStats: stats,
+            updatedStats: updatedStats,
+            progress,
+            isComplete,
+            calculation: `${updatedStats.success} + ${updatedStats.skipped} + ${updatedStats.errors} >= ${updatedStats.total} = ${(updatedStats.success + updatedStats.skipped + updatedStats.errors) >= updatedStats.total}`,
+            processIsCompleted: process.isCompleted
+          });
+          
+          // If complete, mark as completed immediately
+          if (isComplete && !process.isCompleted) {
+            console.log(`✅ Home: Process ${processId} is complete based on HTTP response stats, marking as completed immediately`);
+            const completionTime = Date.now();
+            const processStartTime = process.startTime || completionTime;
+            const finalElapsedTime = Math.floor((completionTime - processStartTime) / 1000);
+            
+            // Stop timer
+            if (processTimersRef.current[processId]) {
+              clearInterval(processTimersRef.current[processId]);
+              delete processTimersRef.current[processId];
+            }
+            
+            // Cancel fallback timeout if it exists
+            if (process.fallbackTimeoutId) {
+              clearTimeout(process.fallbackTimeoutId);
+            }
+            
+            const updated = {
+              ...prev,
+              [processId]: {
+                ...process,
+                isActive: false,
+                isCompleted: true,
+                elapsedTime: finalElapsedTime,
+                stats: updatedStats,
+                progress: 100,
+              },
+            };
+            
+            // Force save to localStorage immediately
+            localStorage.setItem('homeProcesses', JSON.stringify(updated));
+            console.log(`💾 Home: Force-saved completed process ${processId} to localStorage (HTTP response)`);
+            
+            // Notify Monitor that process is completed
+            window.dispatchEvent(new CustomEvent('processCompleted', {
+              detail: {
+                processId,
+                stats: updatedStats,
+                elapsedTime: finalElapsedTime,
+                stepName: process.stepName,
+                sheetName: process.sheetName,
+              }
+            }));
+            console.log(`📢 Home: Notified Monitor that process ${processId} is completed`);
+            
+            return updated;
+          }
+          
+          return {
+            ...prev,
+            [processId]: {
+              ...process,
+              stats: updatedStats,
+              progress: Math.min(progress, 100),
+            },
+          };
+        }
+        return prev;
+      });
+      
+      // Fallback: If HTTP request completes successfully but we don't receive 'complete' message
+      // within 2 seconds, mark as completed anyway using stats from HTTP response
+      // This handles cases where WebSocket closes before receiving the complete message
+      const fallbackTimeoutId = setTimeout(() => {
+        setProcesses(prev => {
+          const process = prev[processId];
+          if (process && !process.isCompleted && process.isActive) {
+            console.log(`⏰ Home: Fallback - marking process ${processId} as completed after HTTP success (no complete message received within 2s)`);
+            const completionTime = Date.now();
+            const processStartTime = process.startTime || completionTime;
+            const finalElapsedTime = Math.floor((completionTime - processStartTime) / 1000);
+            
+            // Stop timer
+            if (processTimersRef.current[processId]) {
+              clearInterval(processTimersRef.current[processId]);
+              delete processTimersRef.current[processId];
+            }
+            
+            // Use stats from HTTP response - they are the source of truth
+            const finalStats = {
+              total: stats.total || process.stats.total || 0,
+              processed: stats.processed || stats.success || process.stats.processed || 0,
+              success: stats.success || stats.processed || process.stats.success || 0,
+              errors: stats.errors_count || stats.errors || process.stats.errors || 0,
+              skipped: stats.skipped || process.stats.skipped || 0,
+              initialEmptyRows: process.stats.initialEmptyRows || 0,
+            };
+            
+            const updated = {
+              ...prev,
+              [processId]: {
+                ...process,
+                isActive: false,
+                isCompleted: true,
+                elapsedTime: finalElapsedTime,
+                stats: finalStats,
+                progress: 100,
+              },
+            };
+            
+            // Force save to localStorage immediately
+            localStorage.setItem('homeProcesses', JSON.stringify(updated));
+            console.log(`💾 Home: Force-saved completed process ${processId} to localStorage (fallback) with stats:`, finalStats);
+            
+            // Notify Monitor that process is completed
+            window.dispatchEvent(new CustomEvent('processCompleted', {
+              detail: {
+                processId,
+                stats: finalStats,
+                elapsedTime: finalElapsedTime,
+                stepName: process.stepName,
+                sheetName: process.sheetName,
+              }
+            }));
+            console.log(`📢 Home: Notified Monitor that process ${processId} is completed (fallback)`);
+            
+            return updated;
+          }
+          return prev;
+        });
+      }, 2000); // Wait 2 seconds after HTTP response
+      
+      // Store timeout ID so we can clear it if complete message arrives
+      setProcesses(prev => {
+        const process = prev[processId];
+        if (process) {
+          return {
+            ...prev,
+            [processId]: {
+              ...process,
+              fallbackTimeoutId: fallbackTimeoutId,
+            },
+          };
+        }
+        return prev;
+      });
       
       // Note: History is now saved when WebSocket sends 'complete' message
       // to ensure we capture the elapsed time correctly
@@ -898,7 +1064,9 @@ export default function Home() {
     <>
       <NavigationBar
         notifications={notifications}
-        onClearNotifications={handleClearNotifications}
+        onClearNotifications={clearNotifications}
+        onMarkAllRead={markAllAsRead}
+        onMarkAsRead={markAsRead}
       />
 
       <Box sx={{ background: '#f5f5f5', minHeight: '100vh', pt: '80px', pb: 4 }}>
@@ -909,8 +1077,13 @@ export default function Home() {
           {/* Sheet Selection Card */}
           <Card sx={{ mb: 4, borderRadius: 2, boxShadow: 3 }}>
             <CardContent sx={{ p: 3 }}>
-              <Typography variant="h5" gutterBottom sx={{ fontWeight: 600, color: '#1a2746', mb: 3 }}>
+              <Typography variant="h5" gutterBottom sx={{ fontWeight: 600, color: '#1a2746', mb: 2 }}>
                 Connect Google Sheet
+              </Typography>
+              <Typography variant="body2" sx={{ color: '#666', mb: 3, fontStyle: 'italic' }}>
+                {sheetHeaders.length > 0 
+                  ? '✓ Sheet loaded successfully. You can now see the available automation steps below.'
+                  : 'Once you load a sheet, you will be able to see the available automation steps below.'}
               </Typography>
             <SheetSelector onSheetSelected={handleSheetSelected} />
             </CardContent>

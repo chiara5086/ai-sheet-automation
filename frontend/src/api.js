@@ -86,6 +86,16 @@ export const getHistoryGrouped = async () => {
   }
 };
 
+export const clearHistory = async () => {
+  try {
+    const response = await axios.delete(`${API_BASE}/history`);
+    return response.data;
+  } catch (error) {
+    console.error('Error clearing history:', error);
+    throw error;
+  }
+};
+
 export const getActiveSessions = async () => {
   try {
     const response = await axios.get(`${API_BASE}/active-sessions`);

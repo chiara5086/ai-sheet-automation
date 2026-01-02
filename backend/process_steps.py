@@ -11,7 +11,7 @@ async def build_description(rows, col_indices, session_id=None, custom_prompt=No
     Step 1: Build Description
     
     Generates technical descriptions for assets using Perplexity (or OpenAI as fallback) based on asset name,
-    technical specifications, and AI Data (if available). Only fills empty 'AI Description' cells.
+    Raw Trusted Data, and AI Data (if available). Only fills empty 'Script Technical Description' cells.
     Prioritizes Perplexity if API key is available, falls back to OpenAI if not.
     
     Args:
@@ -20,7 +20,7 @@ async def build_description(rows, col_indices, session_id=None, custom_prompt=No
         
     Returns:
         tuple: (updated_rows, errors)
-            - updated_rows: List of rows with updated AI Description values
+            - updated_rows: List of rows with updated Script Technical Description values
             - errors: List of error messages encountered during processing
     """
     print("DEBUG: build_description function called")
@@ -99,26 +99,31 @@ async def build_description(rows, col_indices, session_id=None, custom_prompt=No
 
     errors = []
     
-    desc_idx = col_indices.get('AI Description')
-    tech_idx = col_indices.get('Technical Specifications')
+    desc_idx = col_indices.get('Script Technical Description')
+    tech_idx = col_indices.get('Raw Trusted Data')
     ai_data_idx = col_indices.get('AI Data')  # Now mandatory
     asset_idx = None
     
-    # Find the asset name/title column (T2/T3/T4) - case-insensitive, ignoring spaces
-    for k, idx in col_indices.items():
-        if idx is None:
-            continue
-        norm_key = ''.join(k.lower().split())
-        if 'yomoemmodel' in norm_key:
-            asset_idx = idx
-            print(f"DEBUG: Found asset column using key '{k}' at index {idx}")
-            break
+    # Find the asset name/title column - starts with "YOM > OEM > MODEL"
+    asset_name_key = 'YOM > OEM > MODEL'
+    asset_idx = col_indices.get(asset_name_key)
+    if asset_idx is None:
+        # Fallback: try to find by pattern matching
+        for k, idx in col_indices.items():
+            if idx is None:
+                continue
+            norm_key = ''.join(k.lower().split())
+            # Check if it starts with "yom>oem>model"
+            if norm_key.startswith('yom>oem>model'):
+                asset_idx = idx
+                print(f"DEBUG: Found asset column using key '{k}' at index {idx}")
+                break
     
     print(f"DEBUG: Column indices found:")
-    print(f"  Asset (YOM OEM Model): {asset_idx}")
-    print(f"  Technical Specifications: {tech_idx}")
+    print(f"  Asset (YOM > OEM > MODEL): {asset_idx}")
+    print(f"  Raw Trusted Data: {tech_idx}")
     print(f"  AI Data: {ai_data_idx}")
-    print(f"  AI Description: {desc_idx}")
+    print(f"  Script Technical Description: {desc_idx}")
     
     # Import websocket manager for progress updates
     from websocket_manager import manager
@@ -204,7 +209,7 @@ async def build_description(rows, col_indices, session_id=None, custom_prompt=No
             "- Immediately state its primary industrial application (e.g., 'engineered for quarry loading', 'designed for earthmoving in construction sites').\n"
             "- Then describe technical systems in prose: engine, transmission, hydraulics, capacities, dimensions, etc. — only if present in input.\n"
             "- Integrate specs into sentences (e.g., 'Powered by a... delivering... hp').\n"
-            "- Use information from both Technical Specifications and AI Data sections.\n"
+            "- Use information from both Raw Trusted Data and AI Data sections.\n"
             "- NEVER use subjective, promotional, or evaluative language (e.g., 'robust', 'powerful', 'efficient', 'top-performing').\n"
             "- Use only facts from 'Raw' or 'Clean' input. Do not invent data.\n"
             "- Output must be one paragraph. No bullets, dashes, markdown, or lists.\n"
@@ -355,7 +360,7 @@ async def build_description(rows, col_indices, session_id=None, custom_prompt=No
     
     print(f"\n📊 Processing Summary:")
     print(f"  - Total rows processed: {len(rows)}")
-    print(f"  - Rows with empty AI Description (candidates): {processed_count + skipped_filled}")
+    print(f"  - Rows with empty Script Technical Description (candidates): {processed_count + skipped_filled}")
     print(f"  - Rows skipped (already have description): {skipped_filled}")
     print(f"  - Rows skipped (missing data): {skipped_missing_data}")
     print(f"  - Rows successfully filled with description: {processed_count - len([e for e in errors if 'Row' in e])}")
@@ -364,7 +369,7 @@ async def build_description(rows, col_indices, session_id=None, custom_prompt=No
     return rows, errors
 
 
-def ai_source_comparables(rows, col_indices, custom_prompt=None):
+def ai_source_comparables(rows, col_indices, custom_prompt=None, session_id=None):
     """
     Step 2: AI Source Comparables
     
@@ -463,24 +468,30 @@ def ai_source_comparables(rows, col_indices, custom_prompt=None):
     
     errors = []
     
-    # Find asset column: any header containing 'yom oem model' (case-insensitive, ignoring ALL spaces)
-    asset_idx = None
-    for k, idx in col_indices.items():
-        if idx is None:
-            continue
-        norm_key = ''.join(k.lower().split())
-        if 'yomoemmodel' in norm_key:
-            asset_idx = idx
-            print(f"DEBUG: Found asset column using key '{k}' at index {idx}")
-            break
+    # Find asset column: starts with "YOM > OEM > MODEL"
+    asset_name_key = 'YOM > OEM > MODEL'
+    asset_idx = col_indices.get(asset_name_key)
+    if asset_idx is None:
+        # Fallback: try to find by pattern matching
+        for k, idx in col_indices.items():
+            if idx is None:
+                continue
+            norm_key = ''.join(k.lower().split())
+            # Check if it starts with "yom>oem>model"
+            if norm_key.startswith('yom>oem>model'):
+                asset_idx = idx
+                print(f"DEBUG: Found asset column using key '{k}' at index {idx}")
+                break
     
     # Get other column indices
-    tech_idx = col_indices.get('Technical Specifications')
+    tech_idx = col_indices.get('Raw Trusted Data')
+    ai_data_idx = col_indices.get('AI Data')
     comparable_idx = col_indices.get('AI Comparable Price')
     
     print(f"DEBUG: Column indices found:")
-    print(f"  Asset (YOM OEM Model): {asset_idx}")
-    print(f"  Technical Specifications: {tech_idx}")
+    print(f"  Asset (YOM > OEM > MODEL): {asset_idx}")
+    print(f"  Raw Trusted Data: {tech_idx}")
+    print(f"  AI Data: {ai_data_idx}")
     print(f"  AI Comparable Price: {comparable_idx}")
 
     # Check required columns
@@ -513,6 +524,7 @@ def ai_source_comparables(rows, col_indices, custom_prompt=None):
     processed_count = 0
     skipped_filled = 0
     skipped_missing_data = 0
+    success_count = 0
     
     print(f"DEBUG: Starting to process {len(rows)} rows for comparables search...")
     
@@ -535,6 +547,7 @@ def ai_source_comparables(rows, col_indices, custom_prompt=None):
         # Extract required data
         asset = safe_get_cell(row, asset_idx)
         tech = safe_get_cell(row, tech_idx)
+        ai_data = safe_get_cell(row, ai_data_idx)
         
         # Skip if required data is missing
         if not asset or not tech:
@@ -545,23 +558,36 @@ def ai_source_comparables(rows, col_indices, custom_prompt=None):
         # Build prompt - use custom if provided, otherwise use default
         if custom_prompt:
             prompt = custom_prompt.replace('{asset}', asset).replace('{tech_specs}', tech)
-            prompt = prompt.replace('{comparable}', '').replace('{ai_data}', '')
+            if ai_data:
+                prompt = prompt.replace('{ai_data}', f"\nAI Data: {ai_data}")
+            else:
+                prompt = prompt.replace('{ai_data}', '')
+            prompt = prompt.replace('{comparable}', '')
         else:
-            prompt = f"""Search the web for this item. For each comparable listing, return ONLY: Condition, Price, and the Listing URL. No extra text. Format each on one line as: Condition: [condition], Price: [price], URL: [link]. Return up to 10 recent results.
+            prompt = f"""You are an expert in construction equipment valuation. Search the web thoroughly for comparable listings of this equipment. You MUST find and return at least 3-10 comparable listings if they exist online. For each comparable listing found, return ONLY: Condition, Price, and the Listing URL. Format each listing on one line exactly as: Condition: [condition], Price: [price], URL: [link]. 
+
+IMPORTANT: 
+- Search multiple equipment marketplaces (Machinery Pete, IronPlanet, eBay, Equipment Trader, etc.)
+- Return up to 10 recent results if available
+- If a listing doesn't have a price, use "Not listed" or "Call for Price" as the price
+- Only return listings that are actually for sale (not just specifications pages)
+- If you cannot find any comparables after thorough searching, return a brief explanation
 
 Asset: {asset}
-Technical Specifications: {tech}"""
+Raw Trusted Data: {tech}"""
+            if ai_data:
+                prompt += f"\nAI Data: {ai_data}"
         
         try:
             print(f"DEBUG: Row {row_num}: Calling API for comparables search...")
             response = client.chat.completions.create(
                 model=model_name,
                 messages=[
-                    {"role": "system", "content": "You are a web search assistant. Search for comparable listings and return only Condition, Price, and URL for each listing, formatted as specified."},
+                    {"role": "system", "content": "You are an expert in construction equipment valuation. Your task is to search thoroughly across multiple equipment marketplaces and find as many comparable listings as possible. Always return listings in the exact format specified: Condition: [condition], Price: [price], URL: [link]. Search extensively - don't give up after finding just one or two listings."},
                     {"role": "user", "content": prompt}
                 ],
                 temperature=0.3,
-                max_tokens=1000  # More tokens for multiple listings
+                max_tokens=1500  # More tokens for multiple listings
             )
             
             comparable_text = response.choices[0].message.content.strip()
@@ -574,7 +600,12 @@ Technical Specifications: {tech}"""
                 
                 # Store the comparable data
                 row[comparable_idx] = comparable_text
+                success_count += 1
                 print(f"✅ Row {row_num}: Successfully found comparables ({len(comparable_text)} chars)")
+                
+                # Send progress update every time we successfully fill a row
+                # Use a simple approach: store progress updates to send later
+                # (We'll send them from routes.py which is async)
             else:
                 print(f"⚠️ Row {row_num}: No comparables found")
         
@@ -601,23 +632,39 @@ Technical Specifications: {tech}"""
                 
                 print(f"❌ {error_msg}")
                 errors.append(error_msg)
-                # Stop processing on critical errors
-                return rows, errors
+                # Stop processing on critical errors - return with current stats
+                return rows, errors, {
+                    "total": len(rows),
+                    "processed": processed_count,
+                    "success": success_count,
+                    "skipped": skipped_filled + skipped_missing_data,
+                    "errors_count": len(errors)
+                }
             
             # Non-critical errors: log and continue
             error_msg = f'Row {row_num}: API error: {error_detail}'
             errors.append(error_msg)
             print(f"❌ {error_msg}")
     
+    # Calculate final statistics
+    row_errors = len([e for e in errors if 'Row' in e])
+    final_success = success_count
+    
     print(f"\n📊 Processing Summary:")
     print(f"  - Total rows processed: {len(rows)}")
     print(f"  - Rows with empty AI Comparable Price (candidates): {processed_count + skipped_filled}")
     print(f"  - Rows skipped (already have comparables): {skipped_filled}")
     print(f"  - Rows skipped (missing data): {skipped_missing_data}")
-    print(f"  - Rows successfully filled with comparables: {processed_count - skipped_missing_data - len([e for e in errors if 'Row' in e])}")
+    print(f"  - Rows successfully filled with comparables: {final_success}")
     print(f"  - Errors encountered: {len(errors)}")
     
-    return rows, errors
+    return rows, errors, {
+        "total": len(rows),
+        "processed": processed_count,
+        "success": final_success,
+        "skipped": skipped_filled + skipped_missing_data,
+        "errors_count": len(errors)
+    }
 
 
 def extract_final_price(rows, col_indices, custom_prompt=None):
@@ -727,30 +774,31 @@ def extract_final_price(rows, col_indices, custom_prompt=None):
     errors = []
     filled_rows = []
 
-    # Find asset column: any header containing 'yom oem model' (case-insensitive, ignoring ALL spaces)
-    # The col_indices dict should already have the correct mapping from routes.py
-    # But we need to find it by checking the actual key that was used
-    asset_idx = None
-    for k, idx in col_indices.items():
-        if idx is None:
-            continue
-        # Check if this key matches the asset pattern
-        norm_key = ''.join(k.lower().split())
-        if 'yomoemmodel' in norm_key:
-            asset_idx = idx
-            print(f"DEBUG: Found asset column using key '{k}' at index {idx}")
-            break
+    # Find asset column: starts with "YOM > OEM > MODEL"
+    asset_name_key = 'YOM > OEM > MODEL'
+    asset_idx = col_indices.get(asset_name_key)
+    if asset_idx is None:
+        # Fallback: try to find by pattern matching
+        for k, idx in col_indices.items():
+            if idx is None:
+                continue
+            norm_key = ''.join(k.lower().split())
+            # Check if it starts with "yom>oem>model"
+            if norm_key.startswith('yom>oem>model'):
+                asset_idx = idx
+                print(f"DEBUG: Found asset column using key '{k}' at index {idx}")
+                break
     
     # Get other column indices - these should be found by name
-    tech_idx = col_indices.get('Technical Specifications')
+    tech_idx = col_indices.get('Raw Trusted Data')
     ai_data_idx = col_indices.get('AI Data')
     comparable_idx = col_indices.get('AI Comparable Price')
     price_idx = col_indices.get('Price')
     
     # Debug: Print what we found
     print(f"DEBUG: Column indices found:")
-    print(f"  Asset (YOM OEM Model): {asset_idx}")
-    print(f"  Technical Specifications: {tech_idx}")
+    print(f"  Asset (YOM > OEM > MODEL): {asset_idx}")
+    print(f"  Raw Trusted Data: {tech_idx}")
     print(f"  AI Data: {ai_data_idx}")
     print(f"  AI Comparable Price: {comparable_idx}")
     print(f"  Price: {price_idx}")
@@ -841,7 +889,7 @@ def extract_final_price(rows, col_indices, custom_prompt=None):
             skipped_missing_data += 1
             missing_fields = []
             if not asset: missing_fields.append("Asset")
-            if not tech: missing_fields.append("Technical Specifications")
+            if not tech: missing_fields.append("Raw Trusted Data")
             if not comparable: missing_fields.append("AI Comparable Price")
             # Only log first few to avoid spam
             if skipped_missing_data <= 5:
@@ -861,7 +909,7 @@ def extract_final_price(rows, col_indices, custom_prompt=None):
             "Choose the single most relevant price, convert it to USD if needed, and return ONLY the final USD amount formatted like 'XXXXXX.XX'. "
             "If no relevant price exists, return blank. Do not add any explanation, note, or extra text.\n"
             f"Asset details:\n{asset}\n"
-            f"Technical specifications:\n{tech}\n"
+            f"Raw Trusted Data:\n{tech}\n"
             f"Comparable listings found online:\n{comparable}\n"
         )
         if ai_data:
@@ -1068,25 +1116,29 @@ def ai_source_new_price(rows, col_indices, custom_prompt=None):
     errors = []
     filled_rows = []
 
-    # Find asset column: any header containing 'yom oem model' (case-insensitive, ignoring ALL spaces)
-    asset_idx = None
-    for k, idx in col_indices.items():
-        if idx is None:
-            continue
-        norm_key = ''.join(k.lower().split())
-        if 'yomoemmodel' in norm_key:
-            asset_idx = idx
-            print(f"DEBUG: Found asset column using key '{k}' at index {idx}")
-            break
+    # Find asset column: starts with "YOM > OEM > MODEL"
+    asset_name_key = 'YOM > OEM > MODEL'
+    asset_idx = col_indices.get(asset_name_key)
+    if asset_idx is None:
+        # Fallback: try to find by pattern matching
+        for k, idx in col_indices.items():
+            if idx is None:
+                continue
+            norm_key = ''.join(k.lower().split())
+            # Check if it starts with "yom>oem>model"
+            if norm_key.startswith('yom>oem>model'):
+                asset_idx = idx
+                print(f"DEBUG: Found asset column using key '{k}' at index {idx}")
+                break
     
     # Get other column indices
-    tech_idx = col_indices.get('Technical Specifications')
+    tech_idx = col_indices.get('Raw Trusted Data')
     ai_data_idx = col_indices.get('AI Data')
     price_idx = col_indices.get('Price')
     
     print(f"DEBUG: Column indices found:")
-    print(f"  Asset (YOM OEM Model): {asset_idx}")
-    print(f"  Technical Specifications: {tech_idx}")
+    print(f"  Asset (YOM > OEM > MODEL): {asset_idx}")
+    print(f"  Raw Trusted Data: {tech_idx}")
     print(f"  AI Data: {ai_data_idx}")
     print(f"  Price: {price_idx}")
 
@@ -1186,7 +1238,7 @@ def ai_source_new_price(rows, col_indices, custom_prompt=None):
             prompt = f"""You are an expert in construction equipment valuation. Based ONLY on the asset details below, return the current market price of a BRAND NEW unit in USD. Return ONLY the price formatted exactly like this: 'XXXXXX.XX'. If no explicit new price is available, return blank. Do not add any words, explanations, notes, or symbols. Do not say 'blank', 'N/A', or anything else. Only output the price or nothing.
 Asset details:
 {asset}
-Technical specifications:
+Raw Trusted Data:
 {tech}"""
             if ai_data:
                 prompt += f"\nAdditional AI data: {ai_data}"
@@ -1329,18 +1381,20 @@ def ai_similar_comparable(rows, col_indices, custom_prompt=None):
     
     # Find column indices
     price_idx = col_indices.get('Price')
-    asset_idx = None
-    tech_idx = col_indices.get('Technical Specifications')
+    asset_name_key = 'YOM > OEM > MODEL'
+    asset_idx = col_indices.get(asset_name_key)
+    if asset_idx is None:
+        # Fallback: try to find by pattern matching
+        for k, idx in col_indices.items():
+            if idx is None:
+                continue
+            norm_key = ''.join(k.lower().split())
+            # Check if it starts with "yom>oem>model"
+            if norm_key.startswith('yom>oem>model'):
+                asset_idx = idx
+                break
+    tech_idx = col_indices.get('Raw Trusted Data')
     ai_data_idx = col_indices.get('AI Data')
-    
-    # Find asset column
-    for k, idx in col_indices.items():
-        if idx is None:
-            continue
-        norm_key = ''.join(k.lower().split())
-        if 'yomoemmodel' in norm_key:
-            asset_idx = idx
-            break
     
     if price_idx is None or asset_idx is None or tech_idx is None:
         error_msg = f'Missing required columns. Found: price_idx={price_idx}, asset_idx={asset_idx}, tech_idx={tech_idx}'
@@ -1406,10 +1460,10 @@ def ai_similar_comparable(rows, col_indices, custom_prompt=None):
                 prompt = prompt.replace('{ai_data}', '')
             prompt = prompt.replace('{comparable}', '')
         else:
-            prompt = f"""You are an expert in construction equipment valuation. Search for similar equipment based on the technical specifications and AI Data provided below. Find comparable assets that match the specifications and characteristics. For each similar asset found, return ONLY: Condition, Price, and the Listing URL. Format each on one line as: Condition: [condition], Price: [price], URL: [link]. Return up to 10 recent results. If no similar assets are found, return blank.
+            prompt = f"""You are an expert in construction equipment valuation. Search for similar equipment based on the Raw Trusted Data and AI Data provided below. Find comparable assets that match the specifications and characteristics. For each similar asset found, return ONLY: Condition, Price, and the Listing URL. Format each on one line as: Condition: [condition], Price: [price], URL: [link]. Return up to 10 recent results. If no similar assets are found, return blank.
 
 Asset: {asset}
-Technical Specifications: {tech}"""
+Raw Trusted Data: {tech}"""
             if ai_data:
                 prompt += f"\nAI Data: {ai_data}"
         

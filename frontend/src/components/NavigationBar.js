@@ -10,7 +10,12 @@ import NotificationBell from './NotificationBell';
  * Fixed navigation bar component with text labels
  * Stays at the top of the page for easy navigation
  */
-export default function NavigationBar({ notifications = [], onClearNotifications }) {
+export default function NavigationBar({ 
+  notifications = [], 
+  onClearNotifications,
+  onMarkAllRead,
+  onMarkAsRead 
+}) {
   const navigate = useNavigate();
   const location = useLocation();
 
@@ -76,12 +81,12 @@ export default function NavigationBar({ notifications = [], onClearNotifications
 
         {/* Right side: Notifications */}
         <Box sx={{ display: 'flex', alignItems: 'center' }}>
-          {onClearNotifications && (
-            <NotificationBell
-              notifications={notifications}
-              onClearAll={onClearNotifications}
-            />
-          )}
+          <NotificationBell
+            notifications={notifications}
+            onClearAll={onClearNotifications}
+            onMarkAllRead={onMarkAllRead}
+            onMarkAsRead={onMarkAsRead}
+          />
         </Box>
       </Toolbar>
     </AppBar>
