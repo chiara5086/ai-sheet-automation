@@ -1,12 +1,7 @@
 import React, { useState } from 'react';
 import {
-  List,
-  ListItem,
-  ListItemButton,
-  ListItemText,
   Box,
   Typography,
-  Paper,
   Button,
   TextField,
   Dialog,
@@ -20,7 +15,7 @@ import PlayArrowIcon from '@mui/icons-material/PlayArrow';
 import CloseIcon from '@mui/icons-material/Close';
 import { DEFAULT_PROMPTS } from './PromptEditor';
 
-export default function StepSelector({ steps, onRunStep, customPrompts, onSavePrompt }) {
+export default function StepSelector({ steps, onRunStep, customPrompts, onSavePrompt, isProcessing = false }) {
   const [selectedStep, setSelectedStep] = useState(null);
   const [showPrompt, setShowPrompt] = useState(false);
   const [editingPrompt, setEditingPrompt] = useState(false);
@@ -64,57 +59,70 @@ export default function StepSelector({ steps, onRunStep, customPrompts, onSavePr
 
   return (
     <>
-      <Paper sx={{ borderRadius: 2, boxShadow: 2 }}>
-        <List sx={{ p: 0 }}>
-          {steps.map((step, index) => (
-            <ListItem
-              key={step.id}
-              disablePadding
+      <Box sx={{ display: 'flex', flexDirection: 'column', gap: 2 }}>
+        {steps.map((step) => (
+          <Button
+            key={step.id}
+            onClick={() => handleStepClick(step)}
+            variant="contained"
+            disabled={isProcessing}
+            fullWidth
+            sx={{
+              py: 2,
+              px: 3,
+              backgroundColor: step.color,
+              color: '#fff',
+              fontWeight: 600,
+              fontSize: '1rem',
+              textTransform: 'none',
+              borderRadius: 2,
+              boxShadow: 2,
+              display: 'flex',
+              alignItems: 'center',
+              justifyContent: 'flex-start',
+              gap: 2,
+              '&:hover': {
+                backgroundColor: step.color,
+                opacity: 0.9,
+                boxShadow: 4,
+                transform: 'translateY(-2px)',
+              },
+              '&:disabled': {
+                backgroundColor: '#e0e0e0',
+                color: '#9e9e9e',
+              },
+              transition: 'all 0.2s ease-in-out',
+            }}
+          >
+            <Box
               sx={{
-                borderBottom: index < steps.length - 1 ? '1px solid #e0e0e0' : 'none',
+                width: 36,
+                height: 36,
+                borderRadius: '50%',
+                backgroundColor: 'rgba(255, 255, 255, 0.3)',
+                color: '#fff',
+                display: 'flex',
+                alignItems: 'center',
+                justifyContent: 'center',
+                fontWeight: 700,
+                fontSize: '1.1rem',
+                flexShrink: 0,
               }}
             >
-              <ListItemButton
-                onClick={() => handleStepClick(step)}
-                sx={{
-                  py: 1.5,
-                  px: 2,
-                  '&:hover': {
-                    backgroundColor: '#f5f5f5',
-                  },
-                }}
-              >
-                <Box
-                  sx={{
-                    width: 32,
-                    height: 32,
-                    borderRadius: '50%',
-                    backgroundColor: step.color,
-                    color: '#fff',
-                    display: 'flex',
-                    alignItems: 'center',
-                    justifyContent: 'center',
-                    fontWeight: 600,
-                    mr: 2,
-                    flexShrink: 0,
-                  }}
-                >
-                  {step.id}
-                </Box>
-                <ListItemText
-                  primary={step.name}
-                  primaryTypographyProps={{
-                    sx: {
-                      fontWeight: 500,
-                      color: '#1a2746',
-                    },
-                  }}
-                />
-              </ListItemButton>
-            </ListItem>
-          ))}
-        </List>
-      </Paper>
+              {step.id}
+            </Box>
+            <Typography
+              sx={{
+                fontWeight: 600,
+                fontSize: '1rem',
+                color: '#fff',
+              }}
+            >
+              {step.name}
+            </Typography>
+          </Button>
+        ))}
+      </Box>
 
       {/* Prompt Dialog */}
       <Dialog

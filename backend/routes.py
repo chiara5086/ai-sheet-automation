@@ -6,6 +6,8 @@ import re
 from sheet_utils import find_column_indices
 from process_steps import build_description
 from websocket_manager import manager
+from database import save_history, get_history, get_history_by_sheet, save_or_update_process, get_active_processes, delete_process
+from typing import Optional
 
 
 def get_column_letter(col_idx):
@@ -37,6 +39,14 @@ class ProcessRequest(BaseModel):
     sheet_name: str = None
     session_id: str = None  # For WebSocket updates
     custom_prompt: str = None  # Custom prompt to use instead of default
+
+# Pydantic model for history request
+class HistoryRequest(BaseModel):
+    sheet_name: str
+    step: Optional[str] = None
+    message: str
+    timestamp: str
+    time: str
 
 # Simple test endpoint to verify POST requests work
 @router.post("/test-process")
@@ -187,6 +197,7 @@ async def process_step(request: ProcessRequest):
             required_names = [
                 r"YOM OEM Model T[234] Category",
                 r"Technical Specifications",
+                r"AI Data",  # Now mandatory
                 r"AI Description"
             ]
         elif step == "AI Source Comparables":
@@ -236,8 +247,13 @@ async def process_step(request: ProcessRequest):
             else:
                 print(f"  - '{name}': NOT FOUND", flush=True)
         
-        # Only require columns that are truly required for the step
-        truly_required = [n for n in required_names if n != r"AI Data"]
+        # Check for required columns (AI Data is now mandatory for Build Description)
+        if step == "Build Description":
+            # For Build Description, AI Data is mandatory
+            truly_required = required_names
+        else:
+            # For other steps, AI Data is optional
+            truly_required = [n for n in required_names if n != r"AI Data"]
         missing = [k for k in truly_required if col_indices.get(k) is None]
         if missing:
             return {"status": "error", "missing_headers": missing, "available_headers": headers}
@@ -248,9 +264,18 @@ async def process_step(request: ProcessRequest):
         custom_prompt = request.custom_prompt  # Get custom prompt if provided
         
         if step == "Build Description":
-            updated_rows, errors = build_description(rows, col_indices, custom_prompt=custom_prompt)
-            # Write back only the description column
+            # Count rows that were already filled before processing
             desc_idx = col_indices.get('AI Description')
+            already_filled_count = 0
+            if desc_idx is not None:
+                for row in rows:
+                    if len(row) > desc_idx:
+                        desc_value = str(row[desc_idx]).strip() if row[desc_idx] else ""
+                        if desc_value:
+                            already_filled_count += 1
+            
+            updated_rows, errors = await build_description(rows, col_indices, session_id=request.session_id, custom_prompt=custom_prompt)
+            # Write back only the description column
             if desc_idx is not None:
                 col_letter = get_column_letter(desc_idx)
                 # Calculate the range: from row 3 to row (3 + number of rows - 1)
@@ -259,6 +284,27 @@ async def process_step(request: ProcessRequest):
                 out_range = f"{sheet_name}!{col_letter}{start_row}:{col_letter}{end_row}" if sheet_name else f"{col_letter}{start_row}:{col_letter}{end_row}"
                 values = [[row[desc_idx] if len(row) > desc_idx else ""] for row in updated_rows]
                 update_sheet_data(sheetId, out_range, values)
+            
+            # Calculate stats for Build Description
+            # Count rows that now have a description (after processing)
+            total_filled_after = 0
+            if desc_idx is not None:
+                for row in updated_rows:
+                    if len(row) > desc_idx:
+                        desc_value = str(row[desc_idx]).strip() if row[desc_idx] else ""
+                        if desc_value:
+                            total_filled_after += 1
+            
+            # Newly filled = total filled after - already filled before
+            newly_filled_count = total_filled_after - already_filled_count
+            
+            # Store stats for response
+            build_description_stats = {
+                "total": len(rows),
+                "filled": newly_filled_count,  # Only newly filled in this run
+                "skipped": already_filled_count,  # Already had description before
+                "errors_count": len(errors)
+            }
         elif step == "AI Source Comparables":
             print(f"\n{'='*60}", flush=True)
             print(f"DEBUG: Starting AI Source Comparables", flush=True)
@@ -425,8 +471,10 @@ async def process_step(request: ProcessRequest):
             "empty_price_rows": empty_prices
         }
         
-        # Add filled_rows if available (for Extract price, AI Source New Price, and AI Similar Comparable steps)
-        if step in ["Extract price from AI Comparable", "AI Source New Price", "AI Similar Comparable"] and 'filled_rows_list' in locals():
+        # Add stats based on step type
+        if step == "Build Description" and 'build_description_stats' in locals():
+            response_data["stats"] = build_description_stats
+        elif step in ["Extract price from AI Comparable", "AI Source New Price", "AI Similar Comparable"] and 'filled_rows_list' in locals():
             response_data["filled_rows"] = filled_rows_list
             # Add stats for better frontend feedback
             response_data["stats"] = {
@@ -437,14 +485,43 @@ async def process_step(request: ProcessRequest):
                 "errors_count": len(errors)
             }
         
-        # Send completion update via WebSocket
+        # Send completion update via WebSocket with final stats
         if request.session_id:
-            await manager.broadcast_to_session(request.session_id, {
+            stats = response_data.get("stats", {})
+            # Calculate skipped: rows that were already filled before processing
+            # For Build Description: skipped = total - filled (newly filled) - errors
+            # For other steps: use stats.skipped if available, otherwise calculate
+            if step == "Build Description":
+                filled = stats.get("filled", 0)
+                errors_count = stats.get("errors_count", 0)
+                skipped = len(rows) - filled - errors_count
+            else:
+                filled = stats.get("filled", 0) or len(response_data.get("filled_rows", []))
+                errors_count = stats.get("errors_count", 0) or len(errors)
+                skipped = stats.get("skipped", 0) or (len(rows) - filled - errors_count)
+            
+            complete_message = {
                 "type": "complete",
                 "step": step,
-                "processed": response_data.get("stats", {}).get("filled", 0) or len(response_data.get("filled_rows", [])),
-                "errors": len(errors),
-            })
+                "total": len(rows),
+                "processed": filled,
+                "success": filled,
+                "errors": errors_count,
+                "skipped": skipped,
+            }
+            print(f"DEBUG: Sending WebSocket complete message to session {request.session_id}: {complete_message}", flush=True)
+            try:
+                await manager.broadcast_to_session(request.session_id, complete_message)
+                print(f"DEBUG: WebSocket complete message sent successfully", flush=True)
+            except Exception as e:
+                print(f"ERROR: Failed to send WebSocket complete message: {e}", flush=True)
+                import traceback
+                traceback.print_exc()
+        else:
+            print(f"WARNING: No session_id provided, skipping WebSocket complete message", flush=True)
+        
+        # Note: History is saved by frontend when WebSocket 'complete' message is received
+        # This ensures the elapsed time is calculated correctly from the process startTime
         
         print(f"DEBUG: Returning response: {response_data}", flush=True)
         return response_data
@@ -464,4 +541,162 @@ async def process_step(request: ProcessRequest):
                 "message": error_msg,
             })
         
+        raise HTTPException(status_code=500, detail=error_msg)
+
+
+# History endpoints
+@router.post("/history")
+async def save_history_endpoint(request: HistoryRequest):
+    """
+    Save a history record to the database
+    """
+    try:
+        history_id = await save_history(
+            sheet_name=request.sheet_name,
+            step=request.step,
+            message=request.message,
+            timestamp=request.timestamp,
+            time=request.time
+        )
+        return {"status": "ok", "id": history_id}
+    except Exception as e:
+        import traceback
+        error_msg = f"Error saving history: {str(e)}"
+        print(f"❌ {error_msg}", flush=True)
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=error_msg)
+
+
+@router.get("/history")
+async def get_history_endpoint(
+    limit: int = Query(100, ge=1, le=1000),
+    sheet_name: Optional[str] = Query(None)
+):
+    """
+    Retrieve history records from the database
+    
+    Args:
+        limit: Maximum number of records to return (default: 100, max: 1000)
+        sheet_name: Optional filter by sheet name
+    """
+    try:
+        if sheet_name:
+            history = await get_history(limit=limit, sheet_name=sheet_name)
+        else:
+            # Return grouped by sheet name
+            grouped = await get_history_by_sheet()
+            # Convert to list format for compatibility
+            history = []
+            for sheet, records in grouped.items():
+                history.extend(records[:limit])
+            # Sort by timestamp descending
+            history.sort(key=lambda x: x.get('timestamp', ''), reverse=True)
+            history = history[:limit]
+        
+        return {"status": "ok", "history": history}
+    except Exception as e:
+        import traceback
+        error_msg = f"Error retrieving history: {str(e)}"
+        print(f"❌ {error_msg}", flush=True)
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=error_msg)
+
+
+@router.get("/history/grouped")
+async def get_history_grouped_endpoint():
+    """
+    Retrieve history records grouped by sheet name
+    """
+    try:
+        grouped = await get_history_by_sheet()
+        return {"status": "ok", "history": grouped}
+    except Exception as e:
+        import traceback
+        error_msg = f"Error retrieving grouped history: {str(e)}"
+        print(f"❌ {error_msg}", flush=True)
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=error_msg)
+
+@router.get("/active-sessions")
+async def get_active_sessions_endpoint():
+    """
+    Get list of active session IDs (processes that are currently running)
+    """
+    try:
+        from websocket_manager import manager
+        active_sessions = manager.get_active_sessions()
+        return {"status": "ok", "active_sessions": active_sessions, "count": len(active_sessions)}
+    except Exception as e:
+        import traceback
+        error_msg = f"Error retrieving active sessions: {str(e)}"
+        print(f"❌ {error_msg}", flush=True)
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=error_msg)
+
+@router.get("/active-processes")
+async def get_active_processes_endpoint():
+    """
+    Get all active and recently completed processes (for shared Monitor)
+    """
+    try:
+        processes = await get_active_processes()
+        return {"status": "ok", "processes": processes}
+    except Exception as e:
+        import traceback
+        error_msg = f"Error retrieving active processes: {str(e)}"
+        print(f"❌ {error_msg}", flush=True)
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=error_msg)
+
+class ActiveProcessRequest(BaseModel):
+    process_id: str
+    step_name: str
+    sheet_name: str
+    session_id: str
+    stats: dict
+    elapsed_time: int = 0
+    is_completed: bool = False
+    is_active: bool = True
+    progress: float = 0
+    start_time: int
+
+@router.post("/active-processes")
+async def save_active_process_endpoint(request: ActiveProcessRequest):
+    """
+    Save or update an active process (for shared Monitor)
+    """
+    try:
+        await save_or_update_process(
+            process_id=request.process_id,
+            step_name=request.step_name,
+            sheet_name=request.sheet_name,
+            session_id=request.session_id,
+            stats=request.stats,
+            elapsed_time=request.elapsed_time,
+            is_completed=request.is_completed,
+            is_active=request.is_active,
+            progress=request.progress,
+            start_time=request.start_time
+        )
+        return {"status": "ok"}
+    except Exception as e:
+        import traceback
+        error_msg = f"Error saving active process: {str(e)}"
+        print(f"❌ {error_msg}", flush=True)
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=error_msg)
+
+@router.delete("/active-processes/{process_id}")
+async def delete_active_process_endpoint(process_id: str):
+    """
+    Delete an active process (for shared Monitor)
+    """
+    try:
+        await delete_process(process_id)
+        return {"status": "ok"}
+    except Exception as e:
+        import traceback
+        error_msg = f"Error deleting active process: {str(e)}"
+        print(f"❌ {error_msg}", flush=True)
+        traceback.print_exc()
         raise HTTPException(status_code=500, detail=error_msg)

@@ -1,0 +1,739 @@
+import React, { useState, useEffect, useRef } from 'react';
+import {
+  Container,
+  Typography,
+  Box,
+  Card,
+  CardContent,
+} from '@mui/material';
+import MonitorIcon from '@mui/icons-material/Monitor';
+import DetailedProgressMonitor from '../components/DetailedProgressMonitor';
+import NavigationBar from '../components/NavigationBar';
+import { saveHistory } from '../api';
+
+/**
+ * Monitor page - Shows detailed progress for all active and completed processes
+ * Each process has its own progress bar that persists
+ * Uses localStorage and events (not shared database)
+ */
+export default function Monitor() {
+  // State for multiple processes
+  const [processes, setProcesses] = useState({}); // { processId: { stepName, stats, elapsedTime, isCompleted, isActive, startTime, sessionId, progress, sheetName } }
+  const processTimersRef = useRef({}); // { processId: timerId }
+  const wsConnectionsRef = useRef({}); // { processId: WebSocket }
+  const historySavedRef = useRef({}); // { processId: true } - Track which processes have already saved history
+
+  // Load processes from localStorage on mount (Monitor uses 'monitorProcesses')
+  useEffect(() => {
+    const savedProcesses = localStorage.getItem('monitorProcesses');
+    if (savedProcesses) {
+      try {
+        const parsed = JSON.parse(savedProcesses);
+        console.log('📥 Monitor: Loaded processes from localStorage:', Object.keys(parsed).length);
+        setProcesses(parsed);
+        
+        // Restart timers for active processes
+        Object.entries(parsed).forEach(([processId, process]) => {
+          if (process.isActive && !process.isCompleted && process.startTime) {
+            startTimer(processId, process.startTime);
+          }
+          // Reconnect WebSocket if needed
+          if (process.isActive && process.sessionId && !wsConnectionsRef.current[processId]) {
+            connectWebSocket(processId, process.sessionId);
+          }
+        });
+      } catch (e) {
+        console.error('Error loading processes from localStorage:', e);
+      }
+    }
+  }, []);
+
+  // Save processes to localStorage whenever they change (Monitor uses 'monitorProcesses')
+  useEffect(() => {
+    if (Object.keys(processes).length > 0) {
+      const toSave = JSON.stringify(processes);
+      localStorage.setItem('monitorProcesses', toSave);
+      console.log('💾 Monitor: Saved processes to localStorage:', Object.keys(processes).length, 'processes');
+    } else {
+      localStorage.removeItem('monitorProcesses');
+      console.log('💾 Monitor: Removed processes from localStorage');
+    }
+  }, [processes]);
+
+  // Timer function for elapsed time
+  const startTimer = (processId, startTime) => {
+    if (processTimersRef.current[processId]) {
+      clearInterval(processTimersRef.current[processId]);
+    }
+
+    const timer = setInterval(() => {
+      setProcesses(prev => {
+        const process = prev[processId];
+        if (!process || !process.isActive || process.isCompleted) {
+          clearInterval(timer);
+          delete processTimersRef.current[processId];
+          return prev;
+        }
+        const elapsed = Math.floor((Date.now() - startTime) / 1000);
+        return {
+          ...prev,
+          [processId]: {
+            ...process,
+            elapsedTime: elapsed,
+          },
+        };
+      });
+    }, 1000);
+
+    processTimersRef.current[processId] = timer;
+  };
+
+  // Listen for new processes from Home page via custom event and localStorage
+  useEffect(() => {
+    const handleStorageChange = (e) => {
+      if (e.key === 'newProcess') {
+        try {
+          const newProcess = JSON.parse(e.newValue);
+          addProcess(newProcess);
+          localStorage.removeItem('newProcess');
+        } catch (err) {
+          console.error('Error parsing new process:', err);
+        }
+      } else if (e.key === 'homeProcesses') {
+        // Only sync NEW processes from Home, don't overwrite existing process state
+        // Monitor manages its own state via WebSocket, so we don't want to overwrite progress updates
+        try {
+          const updatedProcesses = JSON.parse(e.newValue);
+          setProcesses(prev => {
+            const merged = { ...prev };
+            // Only add NEW processes, don't update existing ones (they're managed by WebSocket)
+            Object.keys(updatedProcesses).forEach(processId => {
+              if (!merged[processId]) {
+                // New process from Home, add it
+                merged[processId] = updatedProcesses[processId];
+                // Connect WebSocket and start timer after state update
+                setTimeout(() => {
+                  if (updatedProcesses[processId].isActive && updatedProcesses[processId].startTime) {
+                    startTimer(processId, updatedProcesses[processId].startTime);
+                  }
+                  if (updatedProcesses[processId].isActive && updatedProcesses[processId].sessionId) {
+                    console.log(`🔌 Monitor: Connecting WebSocket for process ${processId} from homeProcesses sync`);
+                    connectWebSocket(processId, updatedProcesses[processId].sessionId);
+                  }
+                }, 0);
+              }
+              // Note: We intentionally don't update existing processes here
+              // Monitor's WebSocket handles all progress updates independently
+            });
+            return merged;
+          });
+        } catch (err) {
+          console.error('Error syncing new processes from Home:', err);
+        }
+      }
+    };
+
+    const handleCustomEvent = (e) => {
+      if (e.detail && e.detail.processId) {
+        addProcess(e.detail);
+      }
+    };
+
+    window.addEventListener('storage', handleStorageChange);
+    window.addEventListener('newProcess', handleCustomEvent);
+    
+    // Also check localStorage periodically (for same-window communication)
+    const checkForNewProcess = setInterval(() => {
+      const newProcessData = localStorage.getItem('newProcess');
+      if (newProcessData) {
+        try {
+          const newProcess = JSON.parse(newProcessData);
+          addProcess(newProcess);
+          localStorage.removeItem('newProcess');
+        } catch (err) {
+          console.error('Error parsing new process:', err);
+        }
+      }
+      // Also sync homeProcesses for same-window communication (only add NEW processes)
+      const homeProcessesData = localStorage.getItem('homeProcesses');
+      if (homeProcessesData) {
+        try {
+          const updatedProcesses = JSON.parse(homeProcessesData);
+          setProcesses(prev => {
+            const merged = { ...prev };
+            // Only add NEW processes, don't update existing ones
+            Object.keys(updatedProcesses).forEach(processId => {
+              if (!merged[processId]) {
+                // Add new process from Home
+                merged[processId] = updatedProcesses[processId];
+                if (updatedProcesses[processId].isActive && updatedProcesses[processId].startTime) {
+                  startTimer(processId, updatedProcesses[processId].startTime);
+                }
+                if (updatedProcesses[processId].isActive && updatedProcesses[processId].sessionId) {
+                  connectWebSocket(processId, updatedProcesses[processId].sessionId);
+                }
+              }
+              // Note: We intentionally don't update existing processes here
+            });
+            return merged;
+          });
+        } catch (err) {
+          console.error('Error syncing new processes from Home:', err);
+        }
+      }
+    }, 500);
+
+    return () => {
+      window.removeEventListener('storage', handleStorageChange);
+      window.removeEventListener('newProcess', handleCustomEvent);
+      clearInterval(checkForNewProcess);
+    };
+  }, []);
+
+  // Add a new process
+  const addProcess = (processData) => {
+    const { processId, stepName, sessionId, initialStats, sheetName } = processData;
+    
+    setProcesses(prev => {
+      // Only add if process doesn't exist, or if it exists but is completed (allow replacement of completed processes)
+      const existingProcess = prev[processId];
+      if (existingProcess && existingProcess.isActive && !existingProcess.isCompleted) {
+        console.log(`📥 Monitor: Process ${processId} already exists and is active, skipping add to preserve progress`);
+        return prev;
+      }
+      
+      // If process exists but is completed, replace it
+      if (existingProcess) {
+        console.log(`📥 Monitor: Process ${processId} exists but is completed, replacing with new data`);
+        // Clean up old WebSocket and timer
+        if (wsConnectionsRef.current[processId]) {
+          wsConnectionsRef.current[processId].close();
+          delete wsConnectionsRef.current[processId];
+        }
+        if (processTimersRef.current[processId]) {
+          clearInterval(processTimersRef.current[processId]);
+          delete processTimersRef.current[processId];
+        }
+      }
+      
+      // Calculate initialEmptyRows if not provided or is 0
+      // This handles the case where Home sends initialEmptyRows: 0 or when we get updates from WebSocket
+      let calculatedInitialEmptyRows = initialStats?.initialEmptyRows || 0;
+      
+      // If initialEmptyRows is 0, try to calculate it
+      if (calculatedInitialEmptyRows === 0 && initialStats?.total !== undefined) {
+        // For Build Description, we can calculate from skipped rows if available
+        if (stepName === "Build Description") {
+          if (initialStats.skipped !== undefined && initialStats.skipped > 0) {
+            // If we have skipped rows, initialEmptyRows = total - skipped
+            calculatedInitialEmptyRows = initialStats.total - initialStats.skipped;
+            console.log(`📊 Monitor: Calculated initialEmptyRows from skipped: ${calculatedInitialEmptyRows} (total: ${initialStats.total}, skipped: ${initialStats.skipped})`);
+          } else if (initialStats.total > 0) {
+            // If no skipped info yet, we'll update it when we get progress updates
+            // For now, keep it as 0 and it will be updated when WebSocket sends skipped count
+            console.log(`📊 Monitor: initialEmptyRows is 0, will be updated from WebSocket progress (total: ${initialStats.total})`);
+          }
+        }
+      }
+      
+      // Log the final value
+      if (calculatedInitialEmptyRows > 0) {
+        console.log(`✅ Monitor: Using initialEmptyRows: ${calculatedInitialEmptyRows} for process ${processId}`);
+      }
+      
+      const newProcess = {
+        stepName,
+        sessionId,
+        sheetName: sheetName || 'Unknown Sheet',
+        stats: {
+          ...(initialStats || { total: 0, processed: 0, success: 0, errors: 0, skipped: 0, initialEmptyRows: 0 }),
+          initialEmptyRows: calculatedInitialEmptyRows, // Use calculated value
+        },
+        elapsedTime: 0,
+        isCompleted: false,
+        isActive: true,
+        progress: 0,
+        startTime: Date.now(),
+      };
+
+      console.log(`📥 Monitor: Adding new process ${processId}:`, {
+        stepName,
+        sheetName: newProcess.sheetName,
+        initialEmptyRows: newProcess.stats.initialEmptyRows,
+        total: newProcess.stats.total,
+        skipped: newProcess.stats.skipped,
+        sessionId
+      });
+
+      const result = {
+        ...prev,
+        [processId]: newProcess,
+      };
+      
+      // Connect WebSocket IMMEDIATELY - this is critical to receive all messages
+      if (sessionId) {
+        console.log(`🔌 Monitor: Connecting WebSocket IMMEDIATELY for process ${processId} with sessionId ${sessionId}`);
+        // Connect immediately, don't wait
+        connectWebSocket(processId, sessionId);
+      } else {
+        console.warn(`⚠️ Monitor: No sessionId provided for process ${processId}`);
+      }
+      
+      // Start timer immediately
+      startTimer(processId, newProcess.startTime);
+      
+      return result;
+    });
+  };
+
+  // Connect WebSocket for a specific process
+  const connectWebSocket = (processId, sessionId) => {
+    const API_BASE = process.env.REACT_APP_API_BASE || 'http://localhost:9000';
+    const wsUrl = API_BASE.replace('http', 'ws') + `/ws/${sessionId}`;
+
+    try {
+      const ws = new WebSocket(wsUrl);
+      
+      // Register message handler FIRST to ensure we catch all messages
+      ws.onmessage = async (event) => {
+        try {
+          const data = JSON.parse(event.data);
+          console.log(`📨 Monitor WebSocket message for process ${processId}:`, data);
+          console.log(`📨 Monitor: Message type: ${data.type}, processId: ${processId}`);
+          
+          if (data.type === 'progress') {
+            console.log(`📊 Monitor WebSocket progress update for process ${processId}:`, data);
+            setProcesses(prev => {
+              const process = prev[processId];
+              if (!process) {
+                console.warn(`⚠️ Monitor: Process ${processId} not found in state for progress update`);
+                return prev;
+              }
+              
+              // Calculate progress
+              const total = data.total || process.stats.total;
+              const success = data.success ?? 0;
+              const skipped = data.skipped ?? 0;
+              const processed = data.processed ?? (success || 0);
+              
+              // Calculate progress: (success + skipped) / total * 100
+              const progress = total > 0 
+                ? Math.min(100, ((success + skipped) / total) * 100)
+                : 0;
+              
+              console.log(`📊 Monitor: Updating progress for ${processId}:`, {
+                dataReceived: {
+                  total: data.total,
+                  success: data.success,
+                  skipped: data.skipped,
+                  processed: data.processed,
+                },
+                calculated: {
+                  total,
+                  success,
+                  skipped,
+                  processed,
+                  progress: `${progress.toFixed(1)}%`,
+                  progressValue: progress
+                },
+                currentState: {
+                  total: process.stats.total,
+                  success: process.stats.success,
+                  skipped: process.stats.skipped,
+                  processed: process.stats.processed,
+                  progress: process.progress
+                }
+              });
+              
+              // Update initialEmptyRows if it's 0 and we now have skipped rows
+              let updatedInitialEmptyRows = process.stats.initialEmptyRows;
+              if (updatedInitialEmptyRows === 0 && skipped > 0 && process.stepName === "Build Description") {
+                updatedInitialEmptyRows = total - skipped;
+                console.log(`📊 Monitor: Updated initialEmptyRows from progress: ${updatedInitialEmptyRows} (total: ${total}, skipped: ${skipped})`);
+              }
+              
+              const updatedProcess = {
+                ...process,
+                stats: {
+                  total: total,
+                  processed: processed,
+                  success: success,
+                  errors: data.errors || 0,
+                  skipped: skipped,
+                  initialEmptyRows: updatedInitialEmptyRows, // Update if needed
+                },
+                progress: progress,
+              };
+              
+              // If progress reaches 100%, set a timeout to mark as completed if complete message doesn't arrive
+              if (progress >= 100 && !process.isCompleted) {
+                console.log(`⏳ Monitor: Progress reached 100% for ${processId}, waiting for complete message...`);
+                // Clear any existing timeout for this process
+                if (process.completionTimeout) {
+                  clearTimeout(process.completionTimeout);
+                }
+                // Set a timeout to auto-complete if complete message doesn't arrive in 3 seconds
+                const timeoutId = setTimeout(() => {
+                  console.log(`⏰ Monitor: Auto-completing process ${processId} after 100% progress (complete message not received)`);
+                  setProcesses(prev => {
+                    const p = prev[processId];
+                    if (p && !p.isCompleted && p.progress >= 100) {
+                      const completionTime = Date.now();
+                      const processStartTime = p.startTime || completionTime;
+                      const finalElapsedTime = Math.floor((completionTime - processStartTime) / 1000);
+                      
+                      // Stop timer
+                      if (processTimersRef.current[processId]) {
+                        clearInterval(processTimersRef.current[processId]);
+                        delete processTimersRef.current[processId];
+                      }
+                      
+                      return {
+                        ...prev,
+                        [processId]: {
+                          ...p,
+                          isActive: false,
+                          isCompleted: true,
+                          elapsedTime: finalElapsedTime,
+                        },
+                      };
+                    }
+                    return prev;
+                  });
+                }, 3000);
+                updatedProcess.completionTimeout = timeoutId;
+              }
+              
+              const updated = {
+                ...prev,
+                [processId]: updatedProcess,
+              };
+              
+              console.log(`📊 Monitor: State after update for ${processId}:`, {
+                stats: updated[processId].stats,
+                progress: updated[processId].progress
+              });
+              
+              return updated;
+            });
+          } else if (data.type === 'complete') {
+            console.log(`✅ Monitor WebSocket received complete message for process ${processId}:`, data);
+            setProcesses(prev => {
+              const process = prev[processId];
+              if (!process) {
+                console.warn(`⚠️ Monitor: Process ${processId} not found in state for complete message`);
+                return prev;
+              }
+              
+              // Cancel auto-completion timeout if it exists
+              if (process.completionTimeout) {
+                clearTimeout(process.completionTimeout);
+                console.log(`⏰ Monitor: Cancelled auto-completion timeout for ${processId}`);
+              }
+              
+              // Stop timer
+              if (processTimersRef.current[processId]) {
+                clearInterval(processTimersRef.current[processId]);
+                delete processTimersRef.current[processId];
+              }
+
+              // Calculate final progress - should be 100% when completed
+              const total = data.total || process.stats.total;
+              const success = data.success || 0;
+              const skipped = data.skipped || 0;
+              const finalElapsedTime = Math.floor((Date.now() - process.startTime) / 1000);
+
+              console.log(`✅ Monitor: Marking process ${processId} as completed:`, {
+                total,
+                success,
+                skipped,
+                elapsedTime: finalElapsedTime
+              });
+
+              // Update initialEmptyRows if it's still 0
+              let finalInitialEmptyRows = process.stats.initialEmptyRows;
+              if (finalInitialEmptyRows === 0 && skipped > 0 && process.stepName === "Build Description") {
+                finalInitialEmptyRows = total - skipped;
+                console.log(`📊 Monitor: Updated initialEmptyRows in complete handler: ${finalInitialEmptyRows} (total: ${total}, skipped: ${skipped})`);
+              }
+
+              const updatedProcess = {
+                ...process,
+                isActive: false,
+                isCompleted: true,
+                elapsedTime: finalElapsedTime,
+                stats: {
+                  total: total,
+                  processed: data.processed || data.success || 0,
+                  success: success,
+                  errors: data.errors || 0,
+                  skipped: skipped,
+                  initialEmptyRows: finalInitialEmptyRows, // Use updated value
+                },
+                progress: 100, // Always 100% when completed
+              };
+
+              console.log(`✅ Monitor: Process ${processId} marked as completed with stats:`, {
+                isCompleted: updatedProcess.isCompleted,
+                isActive: updatedProcess.isActive,
+                progress: updatedProcess.progress,
+                initialEmptyRows: updatedProcess.stats.initialEmptyRows
+              });
+
+              // Save to history immediately with the calculated elapsed time
+              // Only save once per process (avoid duplicates if handler runs multiple times)
+              if (!historySavedRef.current[processId]) {
+                historySavedRef.current[processId] = true;
+                console.log(`💾 Monitor: Marking process ${processId} as history-saved to prevent duplicates`);
+                
+                // Use setTimeout to ensure state update completes first
+                setTimeout(() => {
+                  const formatTime = (seconds) => {
+                    const mins = Math.floor(seconds / 60);
+                    const secs = seconds % 60;
+                    return `${mins.toString().padStart(2, '0')}:${secs.toString().padStart(2, '0')}`;
+                  };
+
+                  const sheetNameToSave = process.sheetName || 'Unknown Sheet';
+                  const stepToSave = data.step || process.stepName;
+                  const successCount = success;
+                  const elapsedTimeToSave = finalElapsedTime;
+                  
+                  console.log('🔄 Monitor: Saving history with elapsed time:', {
+                    sheetNameToSave,
+                    stepToSave,
+                    successCount,
+                    elapsedTimeToSave,
+                    formatted: formatTime(elapsedTimeToSave)
+                  });
+                  
+                  // Save history asynchronously
+                  saveHistory(
+                    sheetNameToSave,
+                    stepToSave,
+                    `Step '${stepToSave}' completed in ${formatTime(elapsedTimeToSave)}. Filled ${successCount} row(s).`,
+                    new Date().toISOString(),
+                    new Date().toLocaleTimeString()
+                  ).then((result) => {
+                    console.log('✅ Monitor: History saved successfully to database:', result);
+                    // Notify History page to refresh
+                    window.dispatchEvent(new CustomEvent('historyUpdated'));
+                    console.log('📢 Monitor: Dispatched historyUpdated event');
+                  }).catch((err) => {
+                    console.error('❌ Monitor: Failed to save history to database:', err);
+                    console.error('Error details:', err.response?.data || err.message);
+                    // Fallback to localStorage if API fails
+                    const historyItem = {
+                      sheetName: sheetNameToSave,
+                      step: stepToSave,
+                      message: `Step '${stepToSave}' completed in ${formatTime(elapsedTimeToSave)}. Filled ${successCount} row(s).`,
+                      timestamp: new Date().toISOString(),
+                      time: new Date().toLocaleTimeString(),
+                    };
+                    const savedHistory = JSON.parse(localStorage.getItem('sheetHistory') || '[]');
+                    savedHistory.unshift(historyItem);
+                    localStorage.setItem('sheetHistory', JSON.stringify(savedHistory.slice(0, 100)));
+                    console.log('💾 Monitor: History saved to localStorage as fallback');
+                    // Notify History page to refresh
+                    window.dispatchEvent(new CustomEvent('historyUpdated'));
+                    console.log('📢 Monitor: Dispatched historyUpdated event (localStorage)');
+                  });
+                }, 100);
+              } else {
+                console.log(`⚠️ Monitor: History already saved for process ${processId}, skipping duplicate save`);
+              }
+
+              return {
+                ...prev,
+                [processId]: updatedProcess,
+              };
+            });
+          } else if (data.type === 'error') {
+            console.error(`❌ Monitor WebSocket received error message for process ${processId}`);
+            setProcesses(prev => {
+              const process = prev[processId];
+              if (!process) return prev;
+              
+              // Stop timer
+              if (processTimersRef.current[processId]) {
+                clearInterval(processTimersRef.current[processId]);
+                delete processTimersRef.current[processId];
+              }
+
+              return {
+                ...prev,
+                [processId]: {
+                  ...process,
+                  isActive: false,
+                  isCompleted: false,
+                },
+              };
+            });
+          }
+        } catch (e) {
+          console.error(`❌ Monitor: Error parsing WebSocket message for process ${processId}:`, e);
+        }
+      };
+
+      ws.onopen = () => {
+        console.log(`✅ Monitor WebSocket connected for process ${processId}, sessionId: ${sessionId}`);
+        console.log(`🔗 Monitor WebSocket URL: ${wsUrl}`);
+        console.log(`📡 Monitor WebSocket readyState: ${ws.readyState} (OPEN=${WebSocket.OPEN})`);
+        // Store WebSocket immediately when opened
+        wsConnectionsRef.current[processId] = ws;
+        console.log(`💾 Monitor: WebSocket stored in ref for ${processId}`);
+      };
+
+      ws.onerror = (error) => {
+        console.error(`❌ Monitor: WebSocket error for process ${processId}:`, error);
+      };
+
+      ws.onclose = (event) => {
+        console.log(`🔌 Monitor WebSocket disconnected for process ${processId}`, {
+          code: event.code,
+          reason: event.reason,
+          wasClean: event.wasClean
+        });
+        // Clean up the reference
+        if (wsConnectionsRef.current[processId] === ws) {
+          delete wsConnectionsRef.current[processId];
+          console.log(`🗑️ Monitor: Removed WebSocket from ref for ${processId}`);
+        }
+      };
+
+      // Store WebSocket reference immediately (will be updated when opened)
+      wsConnectionsRef.current[processId] = ws;
+      console.log(`💾 Monitor: WebSocket reference stored for ${processId} (before open)`);
+    } catch (e) {
+      console.error(`Failed to create Monitor WebSocket for process ${processId}:`, e);
+    }
+  };
+
+  // Mark a process as completed manually (if it's stuck)
+  const handleMarkAsCompleted = (processId) => {
+    setProcesses(prev => {
+      const process = prev[processId];
+      if (!process) return prev;
+      
+      const updated = {
+        ...prev,
+        [processId]: {
+          ...process,
+          isActive: false,
+          isCompleted: true,
+          progress: 100,
+          elapsedTime: process.startTime ? Math.floor((Date.now() - process.startTime) / 1000) : process.elapsedTime,
+        },
+      };
+      
+      // Update localStorage (Monitor uses 'monitorProcesses')
+      localStorage.setItem('monitorProcesses', JSON.stringify(updated));
+      
+      return updated;
+    });
+    
+    // Stop timer
+    if (processTimersRef.current[processId]) {
+      clearInterval(processTimersRef.current[processId]);
+      delete processTimersRef.current[processId];
+    }
+  };
+
+  // Remove a completed process
+  const handleRemoveProcess = (processId) => {
+    setProcesses(prev => {
+      const updated = { ...prev };
+      delete updated[processId];
+      // Update localStorage immediately (Monitor uses 'monitorProcesses')
+      if (Object.keys(updated).length > 0) {
+        localStorage.setItem('monitorProcesses', JSON.stringify(updated));
+      } else {
+        localStorage.removeItem('monitorProcesses');
+      }
+      return updated;
+    });
+
+    // Clean up WebSocket
+    if (wsConnectionsRef.current[processId]) {
+      wsConnectionsRef.current[processId].close();
+      delete wsConnectionsRef.current[processId];
+    }
+
+    // Clean up timer
+    if (processTimersRef.current[processId]) {
+      clearInterval(processTimersRef.current[processId]);
+      delete processTimersRef.current[processId];
+    }
+  };
+
+  // Cleanup on unmount
+  useEffect(() => {
+    return () => {
+      // Close all WebSocket connections
+      Object.values(wsConnectionsRef.current).forEach(ws => {
+        if (ws && ws.readyState === WebSocket.OPEN) {
+          ws.close();
+        }
+      });
+
+      // Clear all timers
+      Object.values(processTimersRef.current).forEach(timer => {
+        clearInterval(timer);
+      });
+    };
+  }, []);
+
+  const processList = Object.entries(processes);
+
+  return (
+    <>
+      <NavigationBar />
+
+      <Box sx={{ background: '#f5f5f5', minHeight: '100vh', pt: '80px', pb: 4 }}>
+        <Container maxWidth="xl">
+          <Box sx={{ display: 'flex', alignItems: 'center', gap: 2, mb: 4 }}>
+            <MonitorIcon sx={{ color: '#1a2746', fontSize: 36 }} />
+            <Typography variant="h4" sx={{ fontWeight: 700, color: '#1a2746', fontSize: '2rem', lineHeight: 1.2 }}>
+              Process Monitor
+            </Typography>
+          </Box>
+
+          {processList.length === 0 ? (
+            <Card sx={{ borderRadius: 2, boxShadow: 3 }}>
+              <CardContent sx={{ textAlign: 'center', py: 6 }}>
+                <MonitorIcon sx={{ fontSize: 64, color: '#ccc', mb: 2 }} />
+                <Typography variant="h6" color="text.secondary">
+                  No active processes
+                </Typography>
+                <Typography variant="body2" color="text.secondary" sx={{ mt: 1 }}>
+                  Start a process from the Home page to see detailed progress here
+                </Typography>
+              </CardContent>
+            </Card>
+          ) : (
+            <>
+              <Typography variant="h6" sx={{ mb: 3, fontWeight: 600, color: '#1a2746' }}>
+                Active and Completed Processes ({processList.length})
+              </Typography>
+              {processList.map(([processId, process]) => (
+                <DetailedProgressMonitor
+                  key={processId}
+                  processId={processId}
+                  stepName={process.stepName || 'Unknown Step'}
+                  sheetName={process.sheetName}
+                  stats={process.stats || {}}
+                  elapsedTime={process.elapsedTime || 0}
+                  isCompleted={Boolean(process.isCompleted)}
+                  isActive={Boolean(process.isActive)}
+                  onRemove={handleRemoveProcess}
+                  onMarkAsCompleted={handleMarkAsCompleted}
+                  progress={process.progress || 0}
+                />
+              ))}
+            </>
+          )}
+        </Container>
+      </Box>
+    </>
+  );
+}

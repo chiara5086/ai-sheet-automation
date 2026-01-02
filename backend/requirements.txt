@@ -7,3 +7,4 @@ google-auth-oauthlib
 openai>=1.0.0
 requests
 python-dotenv
+aiosqlite

@@ -6,7 +6,7 @@ Contains modular functions for each process step in the asset sheet automation w
 All functions are documented and separated for clarity and maintainability.
 """
 
-def build_description(rows, col_indices, custom_prompt=None):
+async def build_description(rows, col_indices, session_id=None, custom_prompt=None):
     """
     Step 1: Build Description
     
@@ -101,7 +101,7 @@ def build_description(rows, col_indices, custom_prompt=None):
     
     desc_idx = col_indices.get('AI Description')
     tech_idx = col_indices.get('Technical Specifications')
-    ai_data_idx = col_indices.get('AI Data')  # Optional
+    ai_data_idx = col_indices.get('AI Data')  # Now mandatory
     asset_idx = None
     
     # Find the asset name/title column (T2/T3/T4) - case-insensitive, ignoring spaces
@@ -120,8 +120,11 @@ def build_description(rows, col_indices, custom_prompt=None):
     print(f"  AI Data: {ai_data_idx}")
     print(f"  AI Description: {desc_idx}")
     
-    if desc_idx is None or tech_idx is None or asset_idx is None:
-        error_msg = f'Missing required columns. Found: desc_idx={desc_idx}, tech_idx={tech_idx}, asset_idx={asset_idx}'
+    # Import websocket manager for progress updates
+    from websocket_manager import manager
+    
+    if desc_idx is None or tech_idx is None or asset_idx is None or ai_data_idx is None:
+        error_msg = f'Missing required columns. Found: desc_idx={desc_idx}, tech_idx={tech_idx}, asset_idx={asset_idx}, ai_data_idx={ai_data_idx}'
         errors.append(error_msg)
         print(f"ERROR: {error_msg}")
         return rows, errors
@@ -145,17 +148,19 @@ def build_description(rows, col_indices, custom_prompt=None):
     rows_to_process = []
     for i, row in enumerate(rows):
         row_num = i + 3
-        # Skip if already filled
-        if len(row) > desc_idx and row[desc_idx] and str(row[desc_idx]).strip():
+        # Skip if already filled - improved empty cell detection
+        desc_value = safe_get_cell(row, desc_idx)
+        if desc_value and desc_value.strip():
             skipped_filled += 1
             continue
         
-        # Get asset name, technical specs, and AI data (optional)
+        # Get asset name, technical specs, and AI data (now mandatory)
         asset = safe_get_cell(row, asset_idx)
         tech = safe_get_cell(row, tech_idx)
         ai_data = safe_get_cell(row, ai_data_idx)
         
-        if not tech:
+        # Both tech and ai_data are now required
+        if not tech or not ai_data:
             skipped_missing_data += 1
             continue
         
@@ -173,18 +178,19 @@ def build_description(rows, col_indices, custom_prompt=None):
         """Process a single row asynchronously."""
         i, row, row_num, asset, tech, ai_data = row_data
         
+        # Log that AI Data is being used (for first row only to avoid spam)
+        if i == 0:
+            print(f"DEBUG: ✅ Confirmed: AI Data is being used in prompt (sample length: {len(ai_data)} chars)")
+            print(f"DEBUG: ✅ Sample AI Data preview: {ai_data[:100]}..." if len(ai_data) > 100 else f"DEBUG: ✅ AI Data: {ai_data}")
+        
         # Build prompt - use custom if provided, otherwise use default
-        raw_input = tech
-        if ai_data:
-            raw_input += f"\n\n{ai_data}"
+        # AI Data is now mandatory, so always include it
+        raw_input = f"{tech}\n\n{ai_data}"
         
         if custom_prompt:
             # Replace variables in custom prompt
-            prompt = custom_prompt.replace('{asset}', asset).replace('{tech_specs}', tech)
-            if ai_data:
-                prompt = prompt.replace('{ai_data}', f"\n\n{ai_data}")
-            else:
-                prompt = prompt.replace('{ai_data}', '')
+            # AI Data is now mandatory, so always include it
+            prompt = custom_prompt.replace('{asset}', asset).replace('{tech_specs}', tech).replace('{ai_data}', f"\n\n{ai_data}")
             # Remove any remaining variable placeholders if not used
             prompt = prompt.replace('{comparable}', '')
         else:
@@ -198,6 +204,7 @@ def build_description(rows, col_indices, custom_prompt=None):
             "- Immediately state its primary industrial application (e.g., 'engineered for quarry loading', 'designed for earthmoving in construction sites').\n"
             "- Then describe technical systems in prose: engine, transmission, hydraulics, capacities, dimensions, etc. — only if present in input.\n"
             "- Integrate specs into sentences (e.g., 'Powered by a... delivering... hp').\n"
+            "- Use information from both Technical Specifications and AI Data sections.\n"
             "- NEVER use subjective, promotional, or evaluative language (e.g., 'robust', 'powerful', 'efficient', 'top-performing').\n"
             "- Use only facts from 'Raw' or 'Clean' input. Do not invent data.\n"
             "- Output must be one paragraph. No bullets, dashes, markdown, or lists.\n"
@@ -239,20 +246,55 @@ def build_description(rows, col_indices, custom_prompt=None):
             
             return (i, row_num, None, (error_code, error_detail))
     
-    async def process_batch(batch, batch_num, total_batches):
-        """Process a batch of rows in parallel."""
-        print(f"DEBUG: Processing batch {batch_num}/{total_batches} ({len(batch)} rows)...")
-        tasks = [process_single_row(row_data) for row_data in batch]
-        results = await asyncio.gather(*tasks, return_exceptions=True)
-        return results
-    
     # Process in batches of 20
     BATCH_SIZE = 20
     total_batches = (total_to_process + BATCH_SIZE - 1) // BATCH_SIZE
     
+    # Shared counter for progress updates (thread-safe using asyncio.Lock)
+    import asyncio
+    progress_counter = {"success": 0, "errors": 0}
+    progress_lock = asyncio.Lock()
+    
+    async def process_single_row_with_progress(row_data):
+        """Process a single row and send individual progress update."""
+        result = await process_single_row(row_data)
+        
+        # Update counter atomically and send progress update for each completed row
+        async with progress_lock:
+            if result and result[2] is not None:  # Success
+                progress_counter["success"] += 1
+            elif result and result[3] is not None:  # Error
+                progress_counter["errors"] += 1
+            
+            # Send individual progress update
+            if session_id:
+                try:
+                    await manager.broadcast_to_session(session_id, {
+                        "type": "progress",
+                        "step": "Build Description",
+                        "total": len(rows),
+                        "processed": progress_counter["success"] + progress_counter["errors"],
+                        "success": progress_counter["success"],
+                        "errors": progress_counter["errors"],
+                        "skipped": skipped_filled,
+                    })
+                    print(f"DEBUG: Sent progress update: success={progress_counter['success']}, errors={progress_counter['errors']}, total={len(rows)}")
+                except Exception as e:
+                    print(f"DEBUG: Failed to send progress update: {e}")
+        
+        return result
+    
+    async def process_batch(batch, batch_num, total_batches):
+        """Process a batch of rows in parallel with individual progress updates."""
+        print(f"DEBUG: Processing batch {batch_num}/{total_batches} ({len(batch)} rows)...")
+        tasks = [process_single_row_with_progress(row_data) for row_data in batch]
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        return results
+    
     async def process_all_batches():
         """Process all rows in batches."""
         all_results = []
+        
         for batch_num in range(total_batches):
             start_idx = batch_num * BATCH_SIZE
             end_idx = min(start_idx + BATCH_SIZE, total_to_process)
@@ -268,7 +310,7 @@ def build_description(rows, col_indices, custom_prompt=None):
     
     # Run async processing
     try:
-        results = asyncio.run(process_all_batches())
+        results = await process_all_batches()
     except Exception as e:
         error_msg = f'Failed to process batches: {str(e)}'
         print(f"ERROR: {error_msg}")

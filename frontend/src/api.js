@@ -44,3 +44,84 @@ export const runProcessStep = async (sheetId, step, sheetName = null, signal = n
     throw error;
   }
 };
+
+// History API functions
+export const saveHistory = async (sheetName, step, message, timestamp, time) => {
+  try {
+    const response = await axios.post(`${API_BASE}/history`, {
+      sheet_name: sheetName,
+      step: step,
+      message: message,
+      timestamp: timestamp,
+      time: time,
+    });
+    return response.data;
+  } catch (error) {
+    console.error('Error saving history:', error);
+    throw error;
+  }
+};
+
+export const getHistory = async (limit = 100, sheetName = null) => {
+  try {
+    const params = { limit };
+    if (sheetName) {
+      params.sheet_name = sheetName;
+    }
+    const response = await axios.get(`${API_BASE}/history`, { params });
+    return response.data;
+  } catch (error) {
+    console.error('Error retrieving history:', error);
+    throw error;
+  }
+};
+
+export const getHistoryGrouped = async () => {
+  try {
+    const response = await axios.get(`${API_BASE}/history/grouped`);
+    return response.data;
+  } catch (error) {
+    console.error('Error retrieving grouped history:', error);
+    throw error;
+  }
+};
+
+export const getActiveSessions = async () => {
+  try {
+    const response = await axios.get(`${API_BASE}/active-sessions`);
+    return response.data;
+  } catch (error) {
+    console.error('Error retrieving active sessions:', error);
+    throw error;
+  }
+};
+
+export const getActiveProcesses = async () => {
+  try {
+    const response = await axios.get(`${API_BASE}/active-processes`);
+    return response.data;
+  } catch (error) {
+    console.error('Error retrieving active processes:', error);
+    throw error;
+  }
+};
+
+export const saveActiveProcess = async (processData) => {
+  try {
+    const response = await axios.post(`${API_BASE}/active-processes`, processData);
+    return response.data;
+  } catch (error) {
+    console.error('Error saving active process:', error);
+    throw error;
+  }
+};
+
+export const deleteActiveProcess = async (processId) => {
+  try {
+    const response = await axios.delete(`${API_BASE}/active-processes/${processId}`);
+    return response.data;
+  } catch (error) {
+    console.error('Error deleting active process:', error);
+    throw error;
+  }
+};

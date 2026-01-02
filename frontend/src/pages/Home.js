@@ -4,24 +4,21 @@ import {
   Typography,
   Button,
   Box,
-  AppBar,
-  Toolbar,
   Card,
   CardContent,
-  IconButton,
   Snackbar,
   Alert,
+  Chip,
+  CircularProgress,
 } from '@mui/material';
-import { useNavigate } from 'react-router-dom';
+import CheckCircleIcon from '@mui/icons-material/CheckCircle';
 import TablePreview from '../components/TablePreview';
 import SheetSelector from '../components/SheetSelector';
-import RealTimeProgress from '../components/RealTimeProgress';
-import NotificationBell from '../components/NotificationBell';
+import NavigationBar from '../components/NavigationBar';
 import StepSelector from '../components/StepSelector';
 import InstructionsCard from '../components/InstructionsCard';
 import { DEFAULT_PROMPTS } from '../components/PromptEditor';
 import { fetchSheetPreview, runProcessStep } from '../api';
-import HistoryIcon from '@mui/icons-material/History';
 
 const STEPS = [
   { id: 1, name: 'Build Description', color: '#1a2746' },
@@ -32,7 +29,6 @@ const STEPS = [
 ];
 
 export default function Home() {
-  const navigate = useNavigate();
   const [sheetUrl, setSheetUrl] = useState('');
   const [sheetHeaders, setSheetHeaders] = useState([]);
   const [sheetRows, setSheetRows] = useState([]);
@@ -41,23 +37,13 @@ export default function Home() {
   const [notifications, setNotifications] = useState([]);
   const [snackbar, setSnackbar] = useState({ open: false, message: '', severity: 'info' });
 
-  // Processing state
-  const [isProcessing, setIsProcessing] = useState(false);
-  const [currentStep, setCurrentStep] = useState(null);
-  const [progressStats, setProgressStats] = useState({
-    total: 0,
-    processed: 0,
-    success: 0,
-    errors: 0,
-    skipped: 0,
-  });
-  const [elapsedTime, setElapsedTime] = useState(0);
+  // Multiple processes state - each process has its own progress bar
+  const [processes, setProcesses] = useState({}); // { processId: { stepName, stats, elapsedTime, isCompleted, isActive, sessionId } }
+  const processTimersRef = useRef({}); // { processId: timerId }
+  const processAbortControllersRef = useRef({}); // { processId: AbortController }
+  const wsConnectionsRef = useRef({}); // { processId: WebSocket }
+
   const [customPrompts, setCustomPrompts] = useState({});
-  const timerRef = useRef(null);
-  const startTimeRef = useRef(null);
-  const abortControllerRef = useRef(null);
-  const wsRef = useRef(null);
-  const sessionIdRef = useRef(null);
 
   // Step colors
   const stepColors = {
@@ -66,93 +52,523 @@ export default function Home() {
     'AI Similar Comparable': '#e2c69b',
   };
 
-  // Initialize WebSocket connection
-  useEffect(() => {
-    if (!sessionIdRef.current) {
-      sessionIdRef.current = `session_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
+  // Timer function for elapsed time
+  const startTimer = (processId, startTime) => {
+    if (processTimersRef.current[processId]) {
+      clearInterval(processTimersRef.current[processId]);
     }
 
+    const timer = setInterval(() => {
+      setProcesses(prev => {
+        const process = prev[processId];
+        if (!process || !process.isActive) {
+          clearInterval(timer);
+          return prev;
+        }
+        const elapsed = Math.floor((Date.now() - startTime) / 1000);
+        return {
+          ...prev,
+          [processId]: {
+            ...process,
+            elapsedTime: elapsed,
+          },
+        };
+      });
+    }, 100);
+
+    processTimersRef.current[processId] = timer;
+  };
+
+  // Connect WebSocket for a specific process
+  const connectWebSocket = (processId, sessionId) => {
     const API_BASE = process.env.REACT_APP_API_BASE || 'http://localhost:9000';
-    const wsUrl = API_BASE.replace('http', 'ws') + `/ws/${sessionIdRef.current}`;
-    
+    const wsUrl = API_BASE.replace('http', 'ws') + `/ws/${sessionId}`;
+
     try {
       const ws = new WebSocket(wsUrl);
-      ws.onopen = () => {
-        console.log('WebSocket connected');
-      };
-      ws.onmessage = (event) => {
+      
+      // Register message handler FIRST to ensure we catch all messages
+      ws.onmessage = async (event) => {
         try {
           const data = JSON.parse(event.data);
+          console.log(`📨 Home: WebSocket message received for process ${processId}:`, data);
+          console.log(`📨 Home: Message type: ${data.type}, processId: ${processId}`);
+          
           if (data.type === 'progress') {
-            setProgressStats({
-              total: data.total || 0,
-              processed: data.processed || 0,
-              success: data.success || 0,
-              errors: data.errors || 0,
-              skipped: data.skipped || 0,
+            console.log(`📊 Home: WebSocket progress update for process ${processId}:`, data);
+            setProcesses(prev => {
+              const process = prev[processId];
+              if (!process) {
+                console.warn(`⚠️ Home: Process ${processId} not found in state for progress update`);
+                return prev;
+              }
+              
+              // Calculate progress
+              const total = data.total || process.stats.total;
+              const success = data.success ?? 0;
+              const skipped = data.skipped ?? 0;
+              const processed = data.processed ?? (success || 0);
+              
+              // Calculate progress: (success + skipped) / total * 100
+              const progress = total > 0 
+                ? Math.min(100, ((success + skipped) / total) * 100)
+                : 0;
+              
+              console.log(`📊 Home: Updating progress for ${processId}:`, {
+                dataReceived: {
+                  total: data.total,
+                  success: data.success,
+                  skipped: data.skipped,
+                  processed: data.processed,
+                },
+                calculated: {
+                  total,
+                  success,
+                  skipped,
+                  processed,
+                  progress: `${progress.toFixed(1)}%`,
+                  progressValue: progress
+                },
+                currentState: {
+                  total: process.stats.total,
+                  success: process.stats.success,
+                  skipped: process.stats.skipped,
+                  processed: process.stats.processed,
+                  progress: process.progress
+                }
+              });
+              
+              const updatedProcess = {
+                ...process,
+                stats: {
+                  total: total,
+                  processed: processed,
+                  success: success,
+                  errors: data.errors || 0,
+                  skipped: skipped,
+                  initialEmptyRows: process.stats.initialEmptyRows, // Keep fixed
+                },
+                progress: progress,
+              };
+              
+              // If progress reaches 100%, set a timeout to mark as completed if complete message doesn't arrive
+              // This is a fallback in case the WebSocket closes before receiving the 'complete' message
+              if (progress >= 100 && !process.isCompleted) {
+                console.log(`⏳ Progress reached 100% for ${processId}, waiting for complete message...`);
+                // Clear any existing timeout for this process
+                if (process.completionTimeout) {
+                  clearTimeout(process.completionTimeout);
+                }
+                // Set a timeout to auto-complete if complete message doesn't arrive in 5 seconds
+                // Increased from 3 to 5 seconds to give more time for the complete message
+                const timeoutId = setTimeout(() => {
+                  console.log(`⏰ Auto-completing process ${processId} after 100% progress (complete message not received within 5s)`);
+                  setProcesses(prev => {
+                    const p = prev[processId];
+                    if (p && !p.isCompleted && p.progress >= 100) {
+                      const completionTime = Date.now();
+                      const processStartTime = p.startTime || completionTime;
+                      const finalElapsedTime = Math.floor((completionTime - processStartTime) / 1000);
+                      
+                      // Stop timer
+                      if (processTimersRef.current[processId]) {
+                        clearInterval(processTimersRef.current[processId]);
+                        delete processTimersRef.current[processId];
+                      }
+                      
+                      console.log(`✅ Home: Auto-completed process ${processId} (fallback):`, {
+                        isCompleted: true,
+                        isActive: false,
+                        elapsedTime: finalElapsedTime
+                      });
+                      
+                      return {
+                        ...prev,
+                        [processId]: {
+                          ...p,
+                          isActive: false,
+                          isCompleted: true,
+                          elapsedTime: finalElapsedTime,
+                        },
+                      };
+                    }
+                    return prev;
+                  });
+                }, 5000);
+                updatedProcess.completionTimeout = timeoutId;
+              }
+              
+              return {
+                ...prev,
+                [processId]: updatedProcess,
+              };
             });
           } else if (data.type === 'complete') {
-            setIsProcessing(false);
-            setCurrentStep(null);
-            addNotification('success', `Step '${data.step}' completed`, `Processed ${data.processed} rows successfully`);
-            showSnackbar(`Step '${data.step}' completed successfully!`, 'success');
+            console.log('✅ WebSocket received complete message:', { processId, data });
+            console.log('✅ Processing complete message for process:', processId);
+            
+            // Format time as MM:SS
+            const formatTime = (seconds) => {
+              const mins = Math.floor(seconds / 60);
+              const secs = seconds % 60;
+              return `${mins.toString().padStart(2, '0')}:${secs.toString().padStart(2, '0')}`;
+            };
+
+            // Capture the completion time immediately
+            const completionTime = Date.now();
+            
+            setProcesses(prev => {
+              const process = prev[processId];
+              if (!process) {
+                console.warn(`⚠️ Process ${processId} not found in state`);
+                return prev;
+              }
+              
+              // Cancel auto-completion timeout if it exists
+              if (process.completionTimeout) {
+                clearTimeout(process.completionTimeout);
+                console.log(`⏰ Cancelled auto-completion timeout for ${processId}`);
+              }
+              
+              // Calculate elapsed time using the process's startTime
+              const processStartTime = process.startTime || completionTime;
+              const finalElapsedTime = Math.floor((completionTime - processStartTime) / 1000);
+              const finalSheetName = process.sheetName || sheetName || 'Unknown Sheet';
+              
+              console.log('📊 Calculating elapsed time for history:', {
+                processId,
+                startTime: processStartTime,
+                completionTime,
+                elapsedSeconds: finalElapsedTime,
+                formatted: formatTime(finalElapsedTime)
+              });
+              
+              // Stop timer
+              if (processTimersRef.current[processId]) {
+                clearInterval(processTimersRef.current[processId]);
+                delete processTimersRef.current[processId];
+              }
+
+              const progress = process.stats.total > 0 
+                ? ((data.success + data.skipped) / process.stats.total) * 100 
+                : 100;
+
+              const updated = {
+                ...prev,
+                [processId]: {
+                  ...process,
+                  isActive: false,
+                  isCompleted: true,
+                  elapsedTime: finalElapsedTime, // Update elapsedTime with final value
+                  stats: {
+                    total: data.total || process.stats.total,
+                    processed: data.processed || data.success || 0,
+                    success: data.success || 0,
+                    errors: data.errors || 0,
+                    skipped: data.skipped || 0,
+                    initialEmptyRows: process.stats.initialEmptyRows,
+                  },
+                  progress: progress,
+                },
+              };
+
+              // Note: History is saved by Monitor page when it receives the 'complete' message
+              // Home only updates its own state to show "Completed" status
+              
+              addNotification('success', `Step '${data.step}' completed`, `Processed ${data.success || 0} rows successfully`);
+              showSnackbar(`Step '${data.step}' completed successfully!`, 'success');
+              
+              console.log(`✅ Home: Process ${processId} marked as completed:`, {
+                isCompleted: updated[processId].isCompleted,
+                isActive: updated[processId].isActive,
+                progress: updated[processId].progress
+              });
+              
+              // Force save to localStorage immediately to ensure state persists
+              setTimeout(() => {
+                localStorage.setItem('homeProcesses', JSON.stringify(updated));
+                console.log(`💾 Home: Force-saved completed process ${processId} to localStorage`);
+              }, 0);
+              
+              return updated;
+            });
           } else if (data.type === 'error') {
-            setIsProcessing(false);
-            setCurrentStep(null);
-            addNotification('error', `Step '${data.step}' failed`, data.message || 'An error occurred');
-            showSnackbar(`Error: ${data.message}`, 'error');
+            setProcesses(prev => {
+              const process = prev[processId];
+              if (!process) return prev;
+              
+              // Stop timer
+              if (processTimersRef.current[processId]) {
+                clearInterval(processTimersRef.current[processId]);
+                delete processTimersRef.current[processId];
+              }
+
+              addNotification('error', `Step '${data.step}' failed`, data.message || 'An error occurred');
+              showSnackbar(`Error: ${data.message}`, 'error');
+              
+              return {
+                ...prev,
+                [processId]: {
+                  ...process,
+                  isActive: false,
+                  isCompleted: false,
+                },
+              };
+            });
           }
         } catch (e) {
-          console.error('Error parsing WebSocket message:', e);
+          console.error(`❌ Home: Error parsing WebSocket message for process ${processId}:`, e);
         }
       };
+
+      ws.onopen = () => {
+        console.log(`✅ Home WebSocket connected for process ${processId}, sessionId: ${sessionId}`);
+        console.log(`🔗 Home WebSocket URL: ${wsUrl}`);
+        console.log(`📡 Home WebSocket readyState: ${ws.readyState} (OPEN=${WebSocket.OPEN})`);
+        // Store WebSocket immediately when opened
+        wsConnectionsRef.current[processId] = ws;
+        console.log(`💾 Home: WebSocket stored in ref for ${processId}`);
+      };
+
       ws.onerror = (error) => {
-        console.error('WebSocket error:', error);
+        console.error(`❌ Home: WebSocket error for process ${processId}:`, error);
       };
-      ws.onclose = () => {
-        console.log('WebSocket disconnected');
+
+      ws.onclose = (event) => {
+        console.log(`🔌 Home WebSocket disconnected for process ${processId}`, {
+          code: event.code,
+          reason: event.reason,
+          wasClean: event.wasClean
+        });
+        // Clean up the reference
+        if (wsConnectionsRef.current[processId] === ws) {
+          delete wsConnectionsRef.current[processId];
+          console.log(`🗑️ Home: Removed WebSocket from ref for ${processId}`);
+        }
       };
-      wsRef.current = ws;
+
+      // Store WebSocket reference immediately (will be updated when opened)
+      wsConnectionsRef.current[processId] = ws;
+      console.log(`💾 Home: WebSocket reference stored for ${processId} (before open)`);
     } catch (e) {
-      console.error('Failed to create WebSocket:', e);
+      console.error(`Failed to create WebSocket for process ${processId}:`, e);
     }
+  };
+
+  // Notify Monitor page about new/updated process
+  const notifyMonitorPage = (processId, processData) => {
+    const monitorData = {
+      processId,
+      stepName: processData.stepName,
+      sessionId: processData.sessionId,
+      initialStats: processData.stats,
+      sheetName: processData.sheetName, // Include sheetName
+    };
+    console.log(`📢 Home: Notifying Monitor about process ${processId}:`, {
+      stepName: monitorData.stepName,
+      sessionId: monitorData.sessionId,
+      initialEmptyRows: monitorData.initialStats?.initialEmptyRows,
+      total: monitorData.initialStats?.total,
+      sheetName: monitorData.sheetName
+    });
+    localStorage.setItem('newProcess', JSON.stringify(monitorData));
+    // Trigger custom event for same-window communication
+    window.dispatchEvent(new CustomEvent('newProcess', { detail: monitorData }));
+    // Also trigger storage event for other windows
+    window.dispatchEvent(new Event('storage'));
+  };
+
+  // Load sheet data and processes from localStorage on mount
+  useEffect(() => {
+    // Load sheet data
+    const savedSheetUrl = localStorage.getItem('homeSheetUrl');
+    const savedSheetHeaders = localStorage.getItem('homeSheetHeaders');
+    const savedSheetRows = localStorage.getItem('homeSheetRows');
+    const savedSheetName = localStorage.getItem('homeSheetName');
+    
+    if (savedSheetUrl) {
+      setSheetUrl(savedSheetUrl);
+      if (savedSheetHeaders) {
+        try {
+          const parsedHeaders = JSON.parse(savedSheetHeaders);
+          if (parsedHeaders && parsedHeaders.length > 0) {
+            setSheetHeaders(parsedHeaders);
+          }
+        } catch (e) {
+          console.error('Error loading sheet headers:', e);
+        }
+      }
+      if (savedSheetRows) {
+        try {
+          const parsedRows = JSON.parse(savedSheetRows);
+          if (parsedRows && parsedRows.length > 0) {
+            setSheetRows(parsedRows);
+          }
+        } catch (e) {
+          console.error('Error loading sheet rows:', e);
+        }
+      }
+      if (savedSheetName) {
+        setSheetName(savedSheetName);
+      }
+    }
+    
+    // Load processes (Home uses 'homeProcesses', Monitor uses 'monitorProcesses')
+    const savedProcesses = localStorage.getItem('homeProcesses');
+    console.log('🏠 Home: Loading processes from localStorage:', savedProcesses);
+    if (savedProcesses) {
+      try {
+        const parsed = JSON.parse(savedProcesses);
+        console.log('🏠 Home: Parsed processes:', parsed);
+        console.log('🏠 Home: Number of processes:', Object.keys(parsed).length);
+        setProcesses(parsed);
+        // Restart timers for active processes
+        Object.keys(parsed).forEach(processId => {
+          if (parsed[processId].isActive && parsed[processId].startTime) {
+            startTimer(processId, parsed[processId].startTime);
+          }
+          // Reconnect WebSocket if needed
+          if (parsed[processId].isActive && parsed[processId].sessionId && !wsConnectionsRef.current[processId]) {
+            connectWebSocket(processId, parsed[processId].sessionId);
+          }
+        });
+      } catch (e) {
+        console.error('Error loading processes from localStorage:', e);
+      }
+    } else {
+      console.log('🏠 Home: No processes found in localStorage');
+    }
+  }, []);
+
+  // Save processes to localStorage whenever they change (Home uses 'homeProcesses')
+  useEffect(() => {
+    if (Object.keys(processes).length > 0) {
+      localStorage.setItem('homeProcesses', JSON.stringify(processes));
+    } else {
+      // Clear localStorage if no processes
+      localStorage.removeItem('homeProcesses');
+    }
+  }, [processes]);
+
+  // Listen for process completion from Monitor page
+  useEffect(() => {
+    const handleStorageChange = (e) => {
+      if (e.key === 'monitorProcesses') {
+        try {
+          const monitorProcesses = JSON.parse(e.newValue);
+          console.log('🔄 Home: Monitor processes updated, syncing completed processes...');
+          
+          setProcesses(prev => {
+            const updated = { ...prev };
+            let hasChanges = false;
+            
+            // Sync completed processes from Monitor to Home
+            Object.entries(monitorProcesses).forEach(([processId, monitorProcess]) => {
+              if (monitorProcess.isCompleted && prev[processId] && !prev[processId].isCompleted) {
+                console.log(`✅ Home: Syncing completed process ${processId} from Monitor`);
+                updated[processId] = {
+                  ...prev[processId],
+                  isCompleted: true,
+                  isActive: false,
+                  progress: monitorProcess.progress || 100,
+                  elapsedTime: monitorProcess.elapsedTime || prev[processId].elapsedTime,
+                  stats: {
+                    ...prev[processId].stats,
+                    ...monitorProcess.stats,
+                  },
+                };
+                hasChanges = true;
+                
+                // Stop timer if running
+                if (processTimersRef.current[processId]) {
+                  clearInterval(processTimersRef.current[processId]);
+                  delete processTimersRef.current[processId];
+                }
+              }
+            });
+            
+            if (hasChanges) {
+              console.log('💾 Home: Updated processes from Monitor sync');
+              // Force save to localStorage
+              setTimeout(() => {
+                localStorage.setItem('homeProcesses', JSON.stringify(updated));
+              }, 0);
+            }
+            
+            return hasChanges ? updated : prev;
+          });
+        } catch (err) {
+          console.error('Error syncing from Monitor:', err);
+        }
+      }
+    };
+
+    window.addEventListener('storage', handleStorageChange);
+    
+    // Also check periodically for completed processes in Monitor
+    const checkInterval = setInterval(() => {
+      const monitorProcesses = localStorage.getItem('monitorProcesses');
+      if (monitorProcesses) {
+        try {
+          const parsed = JSON.parse(monitorProcesses);
+          setProcesses(prev => {
+            const updated = { ...prev };
+            let hasChanges = false;
+            
+            Object.entries(parsed).forEach(([processId, monitorProcess]) => {
+              if (monitorProcess.isCompleted && prev[processId] && !prev[processId].isCompleted) {
+                console.log(`✅ Home: Periodic sync - marking process ${processId} as completed`);
+                updated[processId] = {
+                  ...prev[processId],
+                  isCompleted: true,
+                  isActive: false,
+                  progress: monitorProcess.progress || 100,
+                  elapsedTime: monitorProcess.elapsedTime || prev[processId].elapsedTime,
+                  stats: {
+                    ...prev[processId].stats,
+                    ...monitorProcess.stats,
+                  },
+                };
+                hasChanges = true;
+                
+                if (processTimersRef.current[processId]) {
+                  clearInterval(processTimersRef.current[processId]);
+                  delete processTimersRef.current[processId];
+                }
+              }
+            });
+            
+            return hasChanges ? updated : prev;
+          });
+        } catch (err) {
+          console.error('Error in periodic sync:', err);
+        }
+      }
+    }, 2000); // Check every 2 seconds
 
     return () => {
-      if (wsRef.current) {
-        wsRef.current.close();
-      }
+      window.removeEventListener('storage', handleStorageChange);
+      clearInterval(checkInterval);
     };
   }, []);
 
-  // Timer for elapsed time
-  useEffect(() => {
-    if (isProcessing) {
-      if (!timerRef.current) {
-        startTimeRef.current = Date.now();
-        timerRef.current = setInterval(() => {
-          if (startTimeRef.current) {
-            const elapsed = Math.floor((Date.now() - startTimeRef.current) / 1000);
-            setElapsedTime(elapsed);
-          }
-        }, 100);
-      }
-    } else {
-      if (timerRef.current) {
-        clearInterval(timerRef.current);
-        timerRef.current = null;
-      }
-      if (!isProcessing) {
-        setElapsedTime(0);
-        startTimeRef.current = null;
-      }
-    }
 
+  // Cleanup on unmount
+  useEffect(() => {
     return () => {
-      if (timerRef.current) {
-        clearInterval(timerRef.current);
-      }
+      // Close all WebSocket connections
+      Object.values(wsConnectionsRef.current).forEach(ws => {
+        if (ws && ws.readyState === WebSocket.OPEN) {
+          ws.close();
+        }
+      });
+
+      // Clear all timers
+      Object.values(processTimersRef.current).forEach(timer => {
+        clearInterval(timer);
+      });
     };
-  }, [isProcessing]);
+  }, []);
 
   const addNotification = (type, title, message) => {
     const notification = {
@@ -188,106 +604,173 @@ export default function Home() {
       if (res.data.sheet_name) {
         setSheetName(res.data.sheet_name);
       }
+      
+      // Save sheet data to localStorage
+      localStorage.setItem('homeSheetUrl', url);
+      localStorage.setItem('homeSheetHeaders', JSON.stringify(res.data.headers));
+      localStorage.setItem('homeSheetRows', JSON.stringify(res.data.rows));
+      if (res.data.sheet_name) {
+        localStorage.setItem('homeSheetName', res.data.sheet_name);
+      }
+      
       addNotification('info', 'Sheet loaded', `${res.data.sheet_name || 'Sheet'} loaded with ${res.data.rows.length} rows`);
       
-      // Save to history
-      const historyItem = {
-        sheetName: res.data.sheet_name || 'Unknown Sheet',
-        message: `Sheet loaded: ${res.data.sheet_name || 'default tab'} with ${res.data.headers.length} columns and ${res.data.rows.length} rows`,
-        timestamp: new Date().toISOString(),
-        time: new Date().toLocaleTimeString(),
-      };
-      const savedHistory = JSON.parse(localStorage.getItem('sheetHistory') || '[]');
-      savedHistory.unshift(historyItem);
-      localStorage.setItem('sheetHistory', JSON.stringify(savedHistory.slice(0, 100))); // Keep last 100
+      // Save to history using API
+      saveHistory(
+        res.data.sheet_name || 'Unknown Sheet',
+        null, // No step for sheet loading
+        `Sheet loaded: ${res.data.sheet_name || 'default tab'} with ${res.data.headers.length} columns and ${res.data.rows.length} rows`,
+        new Date().toISOString(),
+        new Date().toLocaleTimeString()
+      ).then(() => {
+        // Notify History page to refresh
+        window.dispatchEvent(new CustomEvent('historyUpdated'));
+      }).catch((err) => {
+        console.error('Failed to save history to database:', err);
+        // Fallback to localStorage if API fails
+        const historyItem = {
+          sheetName: res.data.sheet_name || 'Unknown Sheet',
+          message: `Sheet loaded: ${res.data.sheet_name || 'default tab'} with ${res.data.headers.length} columns and ${res.data.rows.length} rows`,
+          timestamp: new Date().toISOString(),
+          time: new Date().toLocaleTimeString(),
+        };
+        const savedHistory = JSON.parse(localStorage.getItem('sheetHistory') || '[]');
+        savedHistory.unshift(historyItem);
+        localStorage.setItem('sheetHistory', JSON.stringify(savedHistory.slice(0, 100)));
+        // Notify History page to refresh
+        window.dispatchEvent(new CustomEvent('historyUpdated'));
+      });
     } catch (err) {
       addNotification('error', 'Error loading sheet', err.message);
       showSnackbar(`Error loading sheet: ${err.message}`, 'error');
     }
   };
 
-  const handleRunStep = async (stepName, customPrompt = null) => {
-    if (isProcessing) {
-      showSnackbar('Another step is already running. Please wait.', 'warning');
-      return;
-    }
+  const handleClearSheet = () => {
+    setSheetUrl('');
+    setSheetHeaders([]);
+    setSheetRows([]);
+    setSheetName('');
+    
+    // Clear from localStorage
+    localStorage.removeItem('homeSheetUrl');
+    localStorage.removeItem('homeSheetHeaders');
+    localStorage.removeItem('homeSheetRows');
+    localStorage.removeItem('homeSheetName');
+    
+    showSnackbar('Sheet cleared', 'info');
+  };
 
+  const handleLoadDifferentSheet = () => {
+    handleClearSheet();
+    // Focus on the sheet input field (will be handled by SheetSelector)
+    setTimeout(() => {
+      const input = document.querySelector('input[placeholder*="Google Sheet URL"]');
+      if (input) {
+        input.focus();
+      }
+    }, 100);
+  };
+
+  const handleRunStep = async (stepName, customPrompt = null) => {
     if (!sheetUrl) {
       showSnackbar('Please load a sheet first', 'warning');
       return;
     }
 
-    setIsProcessing(true);
-    setCurrentStep(stepName);
-    setProgressStats({ total: 0, processed: 0, success: 0, errors: 0, skipped: 0 });
-    setElapsedTime(0);
-    startTimeRef.current = Date.now();
+    // Generate unique process ID
+    const processId = `process_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
+    const sessionId = `session_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
 
-    abortControllerRef.current = new AbortController();
+    // Calculate initial empty rows
+    let initialEmptyRows = 0;
+    if (stepName === "Build Description" && sheetRows.length > 0) {
+      const descHeaderIndex = sheetHeaders.findIndex(h => 
+        h && h.toLowerCase().includes('ai description')
+      );
+      if (descHeaderIndex >= 0) {
+        initialEmptyRows = sheetRows.filter(row => {
+          const descValue = row[descHeaderIndex];
+          return !descValue || !String(descValue).trim();
+        }).length;
+        console.log(`📊 Home: Calculated initialEmptyRows: ${initialEmptyRows} for step "${stepName}"`);
+      } else {
+        console.warn(`⚠️ Home: Could not find 'AI Description' column for calculating initialEmptyRows`);
+      }
+    } else {
+      console.log(`📊 Home: Skipping initialEmptyRows calculation (stepName: "${stepName}", sheetRows.length: ${sheetRows.length})`);
+    }
+
+    // Create new process
+    const initialStats = {
+      total: sheetRows.length || 0,
+      processed: 0,
+      success: 0,
+      errors: 0,
+      skipped: 0,
+      initialEmptyRows: initialEmptyRows,
+    };
+
+    const newProcess = {
+      stepName,
+      sessionId,
+      sheetName: sheetName || 'Unknown Sheet', // Store sheetName in process
+      stats: initialStats,
+      elapsedTime: 0,
+      isCompleted: false,
+      isActive: true,
+      progress: 0,
+      startTime: Date.now(),
+    };
+
+    // Add process to state FIRST, then connect WebSocket
+    setProcesses(prev => ({
+      ...prev,
+      [processId]: newProcess,
+    }));
+
+    // Start timer
+    startTimer(processId, newProcess.startTime);
+
+    // Connect WebSocket AFTER state is updated - use setTimeout to ensure state update completes
+    setTimeout(() => {
+      console.log(`🔌 Home: Connecting WebSocket for process ${processId} with sessionId ${sessionId}`);
+      connectWebSocket(processId, sessionId);
+    }, 0);
+
+    // Notify Monitor page (but Monitor will manage its own WebSocket independently)
+    notifyMonitorPage(processId, newProcess);
+
+    // Create abort controller
+    const abortController = new AbortController();
+    processAbortControllersRef.current[processId] = abortController;
+
     addNotification('info', `Step started: ${stepName}`, 'Processing has begun');
     showSnackbar(`Starting ${stepName}...`, 'info');
-
+    
     try {
       const match = sheetUrl.match(/\/d\/([a-zA-Z0-9-_]+)/);
       const sheetId = match ? match[1] : null;
       if (!sheetId) throw new Error('Invalid sheet URL');
-
-      // Use custom prompt if provided, otherwise use saved custom prompt or default
+      
       const promptToUse = customPrompt || customPrompts[stepName] || DEFAULT_PROMPTS[stepName] || null;
 
-      // Include session_id for WebSocket updates
       const res = await runProcessStep(
         sheetId,
         stepName,
         sheetName,
-        abortControllerRef.current?.signal,
-        sessionIdRef.current,
+        abortController.signal,
+        sessionId,
         promptToUse
       );
-
-      setIsProcessing(false);
-      setCurrentStep(null);
 
       const errors = res.data?.errors || [];
       const filledRows = res.data?.filled_rows || [];
       const stats = res.data?.stats || {};
-
-      // Update progress stats
-      setProgressStats({
-        total: stats.total || sheetRows.length,
-        processed: stats.filled || filledRows.length || 0,
-        success: stats.filled || 0,
-        errors: stats.errors_count || errors.length || 0,
-        skipped: (stats.total || 0) - (stats.filled || 0) - (stats.errors_count || 0),
-      });
-
-      const finalTime = startTimeRef.current
-        ? Math.floor((Date.now() - startTimeRef.current) / 1000)
-        : elapsedTime;
-
-      let successMsg = `Step '${stepName}' completed in ${formatTime(finalTime)}.`;
-      if (stats.filled > 0) {
-        successMsg += ` Filled ${stats.filled} row(s).`;
-      }
-      if (stats.errors_count > 0) {
-        successMsg += ` ${stats.errors_count} error(s).`;
-      }
-
-      addNotification('success', `Step completed: ${stepName}`, successMsg);
-      showSnackbar(successMsg, 'success');
-
-      // Save to history
-      const historyItem = {
-        sheetName: sheetName || 'Unknown Sheet',
-        step: stepName,
-        message: successMsg,
-        timestamp: new Date().toISOString(),
-        time: new Date().toLocaleTimeString(),
-      };
-      const savedHistory = JSON.parse(localStorage.getItem('sheetHistory') || '[]');
-      savedHistory.unshift(historyItem);
-      localStorage.setItem('sheetHistory', JSON.stringify(savedHistory.slice(0, 100)));
-
+      
+      // Note: History is now saved when WebSocket sends 'complete' message
+      // to ensure we capture the elapsed time correctly
+      
       // Update price step map
       if (filledRows && filledRows.length > 0) {
         setPriceStepMap((prev) => {
@@ -298,74 +781,130 @@ export default function Home() {
           return updated;
         });
       }
-
+      
       // Refresh sheet data
       if (sheetUrl) {
         const res = await fetchSheetPreview(sheetUrl);
         setSheetRows(res.data.rows);
       }
     } catch (err) {
-      setIsProcessing(false);
-      setCurrentStep(null);
-      const errorMsg = err.response?.data?.detail || err.message || 'Unknown error';
-      
-      if (err.name === 'CanceledError' || err.message === 'canceled') {
-        addNotification('info', `Step cancelled: ${stepName}`, 'Process was cancelled by user');
-        showSnackbar(`Step '${stepName}' was cancelled`, 'info');
-      } else {
-        addNotification('error', `Step failed: ${stepName}`, errorMsg);
-        showSnackbar(`Error: ${errorMsg}`, 'error');
+      setProcesses(prev => {
+        const process = prev[processId];
+        if (!process) return prev;
+        
+        // Stop timer
+        if (processTimersRef.current[processId]) {
+          clearInterval(processTimersRef.current[processId]);
+          delete processTimersRef.current[processId];
+        }
+
+        const errorMsg = err.response?.data?.detail || err.message || 'Unknown error';
+        
+        if (err.name === 'CanceledError' || err.message === 'canceled') {
+          addNotification('info', `Step cancelled: ${stepName}`, 'Process was cancelled by user');
+          showSnackbar(`Step '${stepName}' was cancelled`, 'info');
+        } else {
+          addNotification('error', `Step failed: ${stepName}`, errorMsg);
+          showSnackbar(`Error: ${errorMsg}`, 'error');
+        }
+
+        return {
+          ...prev,
+          [processId]: {
+            ...process,
+            isActive: false,
+            isCompleted: false,
+          },
+        };
+      });
+    }
+  };
+
+  const handleCancelProcess = (processId) => {
+    const abortController = processAbortControllersRef.current[processId];
+    if (abortController) {
+      abortController.abort();
+      delete processAbortControllersRef.current[processId];
+    }
+
+    setProcesses(prev => {
+      const process = prev[processId];
+      if (!process) return prev;
+
+      // Stop timer
+      if (processTimersRef.current[processId]) {
+        clearInterval(processTimersRef.current[processId]);
+        delete processTimersRef.current[processId];
       }
+
+      // Close WebSocket
+      if (wsConnectionsRef.current[processId]) {
+        wsConnectionsRef.current[processId].close();
+        delete wsConnectionsRef.current[processId];
+      }
+
+      addNotification('info', 'Process cancelled', `Process '${process.stepName}' was cancelled`);
+      showSnackbar(`Process '${process.stepName}' was cancelled`, 'info');
+
+      // Remove process completely instead of marking as inactive
+      const updated = { ...prev };
+      delete updated[processId];
+      
+      // Update localStorage immediately (Home uses 'homeProcesses')
+      if (Object.keys(updated).length > 0) {
+        localStorage.setItem('homeProcesses', JSON.stringify(updated));
+      } else {
+        localStorage.removeItem('homeProcesses');
+      }
+      
+      return updated;
+    });
+  };
+
+  const handleRemoveProcess = (processId) => {
+    setProcesses(prev => {
+      const updated = { ...prev };
+      delete updated[processId];
+      // Update localStorage immediately (Home uses 'homeProcesses', Monitor uses 'monitorProcesses')
+      // Note: Removing from Home does NOT remove from Monitor
+      if (Object.keys(updated).length > 0) {
+        localStorage.setItem('homeProcesses', JSON.stringify(updated));
+      } else {
+        localStorage.removeItem('homeProcesses');
+      }
+      
+      return updated;
+    });
+
+    // Clean up
+    if (processTimersRef.current[processId]) {
+      clearInterval(processTimersRef.current[processId]);
+      delete processTimersRef.current[processId];
+    }
+    if (wsConnectionsRef.current[processId]) {
+      wsConnectionsRef.current[processId].close();
+      delete wsConnectionsRef.current[processId];
+    }
+    if (processAbortControllersRef.current[processId]) {
+      delete processAbortControllersRef.current[processId];
     }
   };
 
-  const handleCancel = () => {
-    if (abortControllerRef.current) {
-      abortControllerRef.current.abort();
-      setIsProcessing(false);
-      setCurrentStep(null);
-      setElapsedTime(0);
-      startTimeRef.current = null;
-      abortControllerRef.current = null;
-      addNotification('info', 'Process cancelled', 'The current process was cancelled');
-      showSnackbar('Process cancelled', 'info');
-    }
-  };
-
-  const formatTime = (seconds) => {
-    const mins = Math.floor(seconds / 60);
-    const secs = seconds % 60;
-    return `${mins.toString().padStart(2, '0')}:${secs.toString().padStart(2, '0')}`;
-  };
+  const processList = Object.entries(processes);
+  const activeProcesses = processList.filter(([_, process]) => process.isActive);
+  const hasActiveProcesses = activeProcesses.length > 0;
 
   return (
     <>
-      <AppBar position="static" sx={{ backgroundColor: '#1a2746', boxShadow: 2, borderRadius: 0 }}>
-        <Toolbar sx={{ justifyContent: 'space-between' }}>
-          <Typography variant="h5" component="div" sx={{ fontWeight: 700, color: '#ffffff' }}>
-            Data Structuring Sheet App
-          </Typography>
-          <Box sx={{ display: 'flex', alignItems: 'center', gap: 2 }}>
-            <IconButton
-              onClick={() => navigate('/history')}
-              sx={{ color: '#fff', '&:hover': { backgroundColor: 'rgba(255,255,255,0.1)' } }}
-            >
-              <HistoryIcon />
-            </IconButton>
-            <NotificationBell
-              notifications={notifications}
-              onClearAll={handleClearNotifications}
-            />
-          </Box>
-        </Toolbar>
-      </AppBar>
+      <NavigationBar
+        notifications={notifications}
+        onClearNotifications={handleClearNotifications}
+      />
 
-      <Box sx={{ background: '#f5f5f5', minHeight: 'calc(100vh - 64px)', py: 4 }}>
+      <Box sx={{ background: '#f5f5f5', minHeight: '100vh', pt: '80px', pb: 4 }}>
         <Container maxWidth="xl">
-          {/* Instructions Card */}
-          {!sheetHeaders.length && (
-            <InstructionsCard />
-          )}
+          {/* Instructions Card - Always visible for reference */}
+          <InstructionsCard />
 
           {/* Sheet Selection Card */}
           <Card sx={{ mb: 4, borderRadius: 2, boxShadow: 3 }}>
@@ -373,27 +912,127 @@ export default function Home() {
               <Typography variant="h5" gutterBottom sx={{ fontWeight: 600, color: '#1a2746', mb: 3 }}>
                 Connect Google Sheet
               </Typography>
-              <SheetSelector onSheetSelected={handleSheetSelected} />
+            <SheetSelector onSheetSelected={handleSheetSelected} />
             </CardContent>
           </Card>
+
+          {/* Current Sheet Info */}
+          {sheetName && sheetHeaders.length > 0 && (
+            <Card sx={{ mb: 4, borderRadius: 2, boxShadow: 3, backgroundColor: '#f5f5f5' }}>
+              <CardContent sx={{ p: 2 }}>
+                <Box sx={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', flexWrap: 'wrap', gap: 2 }}>
+                  <Box sx={{ display: 'flex', alignItems: 'center', gap: 1, flexWrap: 'wrap' }}>
+                    <Typography variant="body2" sx={{ color: '#666', fontWeight: 500 }}>
+                      Current Sheet:
+                    </Typography>
+                    <Chip 
+                      label={sheetName} 
+                      sx={{ 
+                        backgroundColor: '#1a2746', 
+                        color: 'white',
+                        fontWeight: 600,
+                        fontSize: '0.875rem'
+                      }} 
+                    />
+                    <Typography variant="body2" sx={{ color: '#666', ml: 1 }}>
+                      ({sheetHeaders.length} columns, {sheetRows.length} rows)
+                    </Typography>
+                  </Box>
+                  <Box sx={{ display: 'flex', gap: 1 }}>
+                    <Button
+                      variant="outlined"
+                      size="small"
+                      onClick={handleLoadDifferentSheet}
+                      sx={{
+                        borderColor: '#1a2746',
+                        color: '#1a2746',
+                        textTransform: 'none',
+                        '&:hover': {
+                          borderColor: '#2d3f66',
+                          backgroundColor: 'rgba(26, 39, 70, 0.04)',
+                        },
+                      }}
+                    >
+                      Load Different Sheet
+                    </Button>
+                    <Button
+                      variant="outlined"
+                      size="small"
+                      onClick={handleClearSheet}
+                      sx={{
+                        borderColor: '#d32f2f',
+                        color: '#d32f2f',
+                        textTransform: 'none',
+                        '&:hover': {
+                          borderColor: '#c62828',
+                          backgroundColor: 'rgba(211, 47, 47, 0.04)',
+                        },
+                      }}
+                    >
+                      Clear Sheet
+                    </Button>
+                  </Box>
+                </Box>
+              </CardContent>
+            </Card>
+          )}
 
           {/* Process Steps Section */}
           {sheetHeaders.length > 0 && (
             <>
               <Card sx={{ mb: 4, borderRadius: 2, boxShadow: 3 }}>
-                <CardContent sx={{ p: 3 }}>
-                  <Typography variant="h5" gutterBottom sx={{ fontWeight: 600, color: '#1a2746', mb: 3 }}>
-                    Automation Steps
-                  </Typography>
+              <CardContent sx={{ p: 3 }}>
+                <Typography variant="h5" gutterBottom sx={{ fontWeight: 600, color: '#1a2746', mb: 3 }}>
+                  Automation Steps
+                </Typography>
 
-                  {/* Real-time Progress */}
-                  {isProcessing && (
-                    <RealTimeProgress
-                      isActive={isProcessing}
-                      currentStep={currentStep}
-                      stats={progressStats}
-                      elapsedTime={elapsedTime}
-                    />
+                  {/* Process Status Indicators - Simple Processing/Completed status */}
+                  {processList.length > 0 && (
+                    <Box sx={{ mb: 3 }}>
+                      {processList.map(([processId, process]) => (
+                        <Box key={processId} sx={{ mb: 2, p: 2, backgroundColor: '#f5f5f5', borderRadius: 1, display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
+                          <Box sx={{ display: 'flex', alignItems: 'center', gap: 2 }}>
+                            {process.isCompleted ? (
+                              <>
+                                <CheckCircleIcon sx={{ color: '#10b981', fontSize: 24 }} />
+                                <Typography variant="body1" sx={{ fontWeight: 600, color: '#1a2746' }}>
+                                  {process.stepName} - Completed
+                                </Typography>
+                              </>
+                            ) : (
+                              <>
+                                <CircularProgress size={20} sx={{ color: '#1e40af' }} />
+                                <Typography variant="body1" sx={{ fontWeight: 600, color: '#1a2746' }}>
+                                  {process.stepName} - Processing...
+                                </Typography>
+                              </>
+                            )}
+                          </Box>
+                          <Box sx={{ display: 'flex', gap: 1 }}>
+                            {process.isActive && (
+                              <Button 
+                                size="small"
+                                variant="outlined"
+                                color="error"
+                                onClick={() => handleCancelProcess(processId)}
+                              >
+                                Cancel
+                              </Button>
+                            )}
+                            {process.isCompleted && (
+                              <Button 
+                                size="small"
+                                variant="text"
+                                onClick={() => handleRemoveProcess(processId)}
+                                sx={{ color: '#999' }}
+                              >
+                                Remove
+                              </Button>
+                            )}
+                          </Box>
+                        </Box>
+                      ))}
+                    </Box>
                   )}
 
                   {/* Step List */}
@@ -402,27 +1041,8 @@ export default function Home() {
                     onRunStep={handleRunStep}
                     customPrompts={customPrompts}
                     onSavePrompt={handleSavePrompt}
+                    isProcessing={hasActiveProcesses}
                   />
-
-                  {/* Cancel Button */}
-                  {isProcessing && (
-                    <Box sx={{ mt: 3, display: 'flex', justifyContent: 'center' }}>
-                      <Button
-                        variant="contained"
-                        onClick={handleCancel}
-                        sx={{
-                          backgroundColor: '#d32f2f',
-                          color: '#fff',
-                          '&:hover': { backgroundColor: '#b71c1c' },
-                          fontWeight: 600,
-                          px: 4,
-                          py: 1.5,
-                        }}
-                      >
-                        Cancel Process
-                      </Button>
-                    </Box>
-                  )}
                 </CardContent>
               </Card>
 
@@ -442,7 +1062,7 @@ export default function Home() {
                 </CardContent>
               </Card>
             </>
-          )}
+            )}
         </Container>
       </Box>
 

@@ -7,19 +7,29 @@ import {
   CardContent,
   Grid,
   Chip,
+  IconButton,
 } from '@mui/material';
 import CheckCircleIcon from '@mui/icons-material/CheckCircle';
 import ErrorIcon from '@mui/icons-material/Error';
 import HourglassEmptyIcon from '@mui/icons-material/HourglassEmpty';
+import CloseIcon from '@mui/icons-material/Close';
 
-export default function RealTimeProgress({
-  isActive,
-  isCompleted,
-  currentStep,
+/**
+ * Detailed progress monitor component for Monitor page
+ * Shows comprehensive progress information with all stats
+ */
+export default function DetailedProgressMonitor({
+  processId,
+  stepName,
+  sheetName,
   stats,
   elapsedTime,
+  isCompleted,
+  isActive,
+  onRemove,
+  onMarkAsCompleted,
+  progress: progressProp,
 }) {
-  // Show component if active or completed (to persist after completion)
   if (!isActive && !isCompleted) {
     return null;
   }
@@ -35,10 +45,16 @@ export default function RealTimeProgress({
   const success = stats.success || 0;
   const errors = stats.errors || 0;
   const skipped = stats.skipped || 0;
-  // Use initial empty rows count (fixed at start) instead of recalculating
   const emptyRows = stats.initialEmptyRows || 0;
-  // Progress should be based on completed rows (success) not just processed
-  const progress = total > 0 ? ((success + skipped) / total) * 100 : 0;
+  // Use progress from prop if provided, otherwise calculate
+  const progress = progressProp !== undefined ? progressProp : (total > 0 ? ((success + skipped) / total) * 100 : 0);
+  
+  // Debug log for empty rows (only log once, not on every render)
+  React.useEffect(() => {
+    if (emptyRows > 0) {
+      console.log(`📊 DetailedProgressMonitor: Process ${processId} has ${emptyRows} empty rows`);
+    }
+  }, [processId, emptyRows]); // Only log when processId or emptyRows changes
 
   return (
     <Card
@@ -47,43 +63,74 @@ export default function RealTimeProgress({
         borderRadius: 2,
         boxShadow: '0 4px 12px rgba(0,0,0,0.1)',
         border: '1px solid #e0e0e0',
+        position: 'relative',
       }}
     >
       <CardContent>
-        <Box sx={{ mb: 2 }}>
-          <Typography variant="h6" sx={{ fontWeight: 600, mb: 1, display: 'flex', alignItems: 'center', gap: 1 }}>
-            {isCompleted ? (
-              <>
-                <CheckCircleIcon sx={{ color: '#4caf50', fontSize: 24 }} />
-                Completed: {currentStep}
-              </>
-            ) : (
-              <>
-                Processing: {currentStep}
-              </>
+        <Box sx={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', mb: 2 }}>
+          <Box sx={{ flex: 1 }}>
+            <Typography variant="h6" sx={{ fontWeight: 600, mb: 1, display: 'flex', alignItems: 'center', gap: 1 }}>
+              {isCompleted ? (
+                <>
+                  <CheckCircleIcon sx={{ color: '#10b981', fontSize: 24 }} />
+                  Completed: {stepName}
+                </>
+              ) : (
+                <>
+                  Processing: {stepName}
+                </>
+              )}
+            </Typography>
+            {sheetName && (
+              <Typography variant="body2" sx={{ fontWeight: 500, color: '#1a2746', mb: 0.5 }}>
+                Sheet: {sheetName}
+              </Typography>
             )}
-          </Typography>
-          <Box sx={{ display: 'flex', alignItems: 'center', gap: 2, mb: 2 }}>
-            <LinearProgress
-              variant="determinate"
-              value={progress}
-              sx={{
-                flexGrow: 1,
-                height: 10,
-                borderRadius: 5,
-                backgroundColor: '#e0e0e0',
-                '& .MuiLinearProgress-bar': {
-                  backgroundColor: isCompleted ? '#4caf50' : '#ff8200',
-                  borderRadius: 5,
-                },
-              }}
-            />
-            <Typography variant="body2" sx={{ fontWeight: 600, minWidth: 60 }}>
-              {Math.round(progress)}%
+            <Typography variant="body2" color="text.secondary">
+              {isCompleted ? 'Total time: ' : 'Elapsed time: '}{formatTime(elapsedTime)}
             </Typography>
           </Box>
-          <Typography variant="body2" color="text.secondary">
-            {isCompleted ? 'Total time: ' : 'Elapsed time: '}{formatTime(elapsedTime)}
+          <Box sx={{ display: 'flex', gap: 1 }}>
+            {!isCompleted && isActive && onMarkAsCompleted && (
+              <IconButton
+                size="small"
+                onClick={() => onMarkAsCompleted(processId)}
+                sx={{ color: '#1e40af', '&:hover': { color: '#1e3a8a' } }}
+                title="Mark as completed"
+              >
+                <CheckCircleIcon />
+              </IconButton>
+            )}
+            {onRemove && isCompleted && (
+              <IconButton
+                size="small"
+                onClick={() => onRemove(processId)}
+                sx={{ color: '#999', '&:hover': { color: '#ef4444' } }}
+                title="Remove process"
+              >
+                <CloseIcon />
+              </IconButton>
+            )}
+          </Box>
+        </Box>
+
+        <Box sx={{ display: 'flex', alignItems: 'center', gap: 2, mb: 2 }}>
+          <LinearProgress
+            variant="determinate"
+            value={progress}
+            sx={{
+              flexGrow: 1,
+              height: 10,
+              borderRadius: 5,
+              backgroundColor: '#e5e7eb',
+              '& .MuiLinearProgress-bar': {
+                backgroundColor: isCompleted ? '#10b981' : '#1e40af',
+                borderRadius: 5,
+              },
+            }}
+          />
+          <Typography variant="body2" sx={{ fontWeight: 600, minWidth: 60 }}>
+            {Math.round(progress)}%
           </Typography>
         </Box>
 
@@ -117,7 +164,7 @@ export default function RealTimeProgress({
               <Typography variant="caption" color="text.secondary">
                 Processed
               </Typography>
-              <Typography variant="h6" sx={{ fontWeight: 600, color: '#4caf50' }}>
+              <Typography variant="h6" sx={{ fontWeight: 600, color: '#10b981' }}>
                 {processed}
               </Typography>
             </Box>
@@ -167,7 +214,7 @@ export default function RealTimeProgress({
               sx={{ backgroundColor: '#e3f2fd', color: '#1976d2', fontWeight: 500 }}
             />
           )}
-          {skipped > 0 && !isCompleted && (
+          {skipped > 0 && (
             <Chip
               label={`${skipped} already filled`}
               size="small"

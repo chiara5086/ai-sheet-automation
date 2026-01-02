@@ -11,29 +11,129 @@ import {
   Card,
   CardContent,
   Divider,
-  IconButton,
 } from '@mui/material';
-import { useNavigate } from 'react-router-dom';
-import ArrowBackIcon from '@mui/icons-material/ArrowBack';
+import NavigationBar from '../components/NavigationBar';
 import HistoryIcon from '@mui/icons-material/History';
 import CheckCircleIcon from '@mui/icons-material/CheckCircle';
 import ErrorIcon from '@mui/icons-material/Error';
 import InfoIcon from '@mui/icons-material/Info';
+import RefreshIcon from '@mui/icons-material/Refresh';
+import { IconButton, CircularProgress } from '@mui/material';
+import { getHistoryGrouped } from '../api';
 
 export default function History() {
-  const navigate = useNavigate();
   const [history, setHistory] = useState([]);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState(null);
+
+  const loadHistory = async () => {
+    try {
+      setLoading(true);
+      setError(null); // Clear any previous errors
+      console.log('📥 History page: Loading history from API...');
+      const response = await getHistoryGrouped();
+      console.log('📥 History page: API response received:', response);
+      
+      if (response.status === 'ok' && response.history) {
+        // Convert grouped history to flat list for compatibility
+        const flatHistory = [];
+        for (const [sheetName, items] of Object.entries(response.history)) {
+          items.forEach(item => {
+            flatHistory.push({
+              ...item,
+              sheetName: item.sheet_name || sheetName, // Use sheet_name from DB or fallback
+            });
+          });
+        }
+        // Sort by timestamp descending
+        flatHistory.sort((a, b) => {
+          const timeA = a.timestamp || a.created_at || '';
+          const timeB = b.timestamp || b.created_at || '';
+          return timeB.localeCompare(timeA);
+        });
+        console.log('📥 History page: Setting history with', flatHistory.length, 'items');
+        setHistory(flatHistory);
+      } else {
+        console.warn('📥 History page: API response not ok or history missing, falling back to localStorage');
+        // Fallback to localStorage if API fails
+        const savedHistory = localStorage.getItem('sheetHistory');
+        if (savedHistory) {
+          try {
+            const parsed = JSON.parse(savedHistory);
+            console.log('📥 History page: Loaded', parsed.length, 'items from localStorage');
+            setHistory(parsed);
+          } catch (e) {
+            console.error('Error loading history from localStorage:', e);
+            setHistory([]);
+          }
+        } else {
+          setHistory([]);
+        }
+      }
+    } catch (err) {
+      console.error('❌ History page: Error loading history from API:', err);
+      setError(err.message);
+      // Fallback to localStorage if API fails
+      const savedHistory = localStorage.getItem('sheetHistory');
+      if (savedHistory) {
+        try {
+          const parsed = JSON.parse(savedHistory);
+          console.log('📥 History page: Loaded', parsed.length, 'items from localStorage (fallback)');
+          setHistory(parsed);
+        } catch (e) {
+          console.error('Error loading history from localStorage:', e);
+          setHistory([]);
+        }
+      } else {
+        setHistory([]);
+      }
+    } finally {
+      setLoading(false);
+      console.log('📥 History page: Loading complete');
+    }
+  };
 
   useEffect(() => {
-    // Load history from localStorage
-    const savedHistory = localStorage.getItem('sheetHistory');
-    if (savedHistory) {
-      try {
-        setHistory(JSON.parse(savedHistory));
-      } catch (e) {
-        console.error('Error loading history:', e);
+    // Load history from API on mount
+    loadHistory();
+
+    // Listen for custom event when history is updated
+    // Use a debounce to avoid multiple rapid reloads
+    let reloadTimeout = null;
+    const handleHistoryUpdate = () => {
+      console.log('📥 History page received historyUpdated event, refreshing...');
+      // Debounce: only reload if no other update comes within 500ms
+      if (reloadTimeout) {
+        clearTimeout(reloadTimeout);
       }
-    }
+      reloadTimeout = setTimeout(() => {
+        loadHistory();
+      }, 500);
+    };
+    window.addEventListener('historyUpdated', handleHistoryUpdate);
+    console.log('👂 History page listening for historyUpdated events');
+
+    // Also listen for storage events (from localStorage fallback)
+    const handleStorageChange = (e) => {
+      if (e.key === 'sheetHistory') {
+        // Debounce storage events too
+        if (reloadTimeout) {
+          clearTimeout(reloadTimeout);
+        }
+        reloadTimeout = setTimeout(() => {
+          loadHistory();
+        }, 500);
+      }
+    };
+    window.addEventListener('storage', handleStorageChange);
+
+    return () => {
+      window.removeEventListener('historyUpdated', handleHistoryUpdate);
+      window.removeEventListener('storage', handleStorageChange);
+      if (reloadTimeout) {
+        clearTimeout(reloadTimeout);
+      }
+    };
   }, []);
 
   const getHistoryIcon = (type) => {
@@ -59,7 +159,7 @@ export default function History() {
 
   // Group history by sheet
   const groupedHistory = history.reduce((acc, item) => {
-    const sheetName = item.sheetName || 'Unknown Sheet';
+    const sheetName = item.sheetName || item.sheet_name || 'Unknown Sheet';
     if (!acc[sheetName]) {
       acc[sheetName] = [];
     }
@@ -68,19 +168,48 @@ export default function History() {
   }, {});
 
   return (
-    <Box sx={{ background: '#f5f5f5', minHeight: '100vh', py: 4 }}>
-      <Container maxWidth="xl">
-        <Box sx={{ display: 'flex', alignItems: 'center', gap: 2, mb: 4 }}>
-          <IconButton onClick={() => navigate('/')} sx={{ color: '#1a2746' }}>
-            <ArrowBackIcon />
-          </IconButton>
-          <HistoryIcon sx={{ color: '#1a2746', fontSize: 32 }} />
-          <Typography variant="h4" sx={{ fontWeight: 700, color: '#1a2746' }}>
-            Sheet Processing History
-          </Typography>
-        </Box>
+    <>
+      <NavigationBar />
+      <Box sx={{ background: '#f5f5f5', minHeight: '100vh', pt: '80px', pb: 4 }}>
+        <Container maxWidth="xl">
+          <Box sx={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', mb: 4 }}>
+            <Box sx={{ display: 'flex', alignItems: 'center', gap: 2 }}>
+              <HistoryIcon sx={{ color: '#1a2746', fontSize: 36 }} />
+              <Typography variant="h4" sx={{ fontWeight: 700, color: '#1a2746', fontSize: '2rem', lineHeight: 1.2 }}>
+                Sheet Processing History
+              </Typography>
+            </Box>
+            <IconButton
+              onClick={loadHistory}
+              disabled={loading}
+              sx={{ color: '#1a2746' }}
+              title="Refresh history"
+            >
+              {loading ? <CircularProgress size={24} /> : <RefreshIcon />}
+            </IconButton>
+          </Box>
 
-        {Object.keys(groupedHistory).length === 0 ? (
+        {loading ? (
+          <Card>
+            <CardContent sx={{ textAlign: 'center', py: 6 }}>
+              <Typography variant="h6" color="text.secondary">
+                Loading history...
+              </Typography>
+            </CardContent>
+          </Card>
+        ) : error ? (
+          <Card>
+            <CardContent sx={{ textAlign: 'center', py: 6 }}>
+              <ErrorIcon sx={{ fontSize: 64, color: '#f44336', mb: 2 }} />
+              <Typography variant="h6" color="text.secondary">
+                Error loading history
+              </Typography>
+              <Typography variant="body2" color="text.secondary" sx={{ mt: 1 }}>
+                {error}
+              </Typography>
+            </CardContent>
+          </Card>
+        ) : Object.keys(groupedHistory).length === 0 ? (
           <Card>
             <CardContent sx={{ textAlign: 'center', py: 6 }}>
               <HistoryIcon sx={{ fontSize: 64, color: '#ccc', mb: 2 }} />
@@ -161,8 +290,9 @@ export default function History() {
             </Card>
           ))
         )}
-      </Container>
-    </Box>
+        </Container>
+      </Box>
+    </>
   );
 }
 

@@ -10,6 +10,7 @@ import config
 
 from routes import router
 from websocket_manager import manager
+from database import init_db
 
 # Configure logging to show in console - FORCE IT
 logging.basicConfig(
@@ -150,6 +151,13 @@ for route in app.routes:
         logger.info(f"  {list(route.methods)} {route.path}")
 
 logger.info("✅ CORS middleware registered")
+
+# Initialize database on startup
+@app.on_event("startup")
+async def startup_event():
+    logger.info("Initializing database...")
+    await init_db()
+    logger.info("✅ Database initialized")
 
 @app.get("/")
 def read_root():
