@@ -11,8 +11,10 @@ async def build_description(rows, col_indices, session_id=None, custom_prompt=No
     Step 1: Build Description
     
     Generates technical descriptions for assets using Perplexity (or OpenAI as fallback) based on asset name,
-    Raw Trusted Data, and AI Data (if available). Only fills empty 'Script Technical Description' cells.
+    Raw Trusted Data, and AI Data (if it has data). Only fills empty 'Script Technical Description' cells.
     Prioritizes Perplexity if API key is available, falls back to OpenAI if not.
+    
+    The 'AI Data' column is mandatory (must exist), but is only included in the prompt if it contains data.
     
     Args:
         rows: List of data rows from the sheet
@@ -159,13 +161,13 @@ async def build_description(rows, col_indices, session_id=None, custom_prompt=No
             skipped_filled += 1
             continue
         
-        # Get asset name, technical specs, and AI data (now mandatory)
+        # Get asset name, technical specs, and AI data (column is mandatory, but only used if it has data)
         asset = safe_get_cell(row, asset_idx)
         tech = safe_get_cell(row, tech_idx)
         ai_data = safe_get_cell(row, ai_data_idx)
         
-        # Both tech and ai_data are now required
-        if not tech or not ai_data:
+        # Only tech is required to have data; AI Data column must exist but can be empty
+        if not tech:
             skipped_missing_data += 1
             continue
         
@@ -184,22 +186,31 @@ async def build_description(rows, col_indices, session_id=None, custom_prompt=No
         i, row, row_num, asset, tech, ai_data = row_data
         
         # Log that AI Data is being used (for first row only to avoid spam)
-        if i == 0:
+        if i == 0 and ai_data:
             print(f"DEBUG: ✅ Confirmed: AI Data is being used in prompt (sample length: {len(ai_data)} chars)")
             print(f"DEBUG: ✅ Sample AI Data preview: {ai_data[:100]}..." if len(ai_data) > 100 else f"DEBUG: ✅ AI Data: {ai_data}")
+        elif i == 0 and not ai_data:
+            print(f"DEBUG: ℹ️ AI Data column exists but is empty for this row - will not be included in prompt")
         
         # Build prompt - use custom if provided, otherwise use default
-        # AI Data is now mandatory, so always include it
-        raw_input = f"{tech}\n\n{ai_data}"
+        # AI Data column is mandatory, but only include it in prompt if it has data
+        if ai_data:
+            raw_input = f"{tech}\n\n{ai_data}"
+        else:
+            raw_input = tech
         
         if custom_prompt:
             # Replace variables in custom prompt
-            # AI Data is now mandatory, so always include it
-            prompt = custom_prompt.replace('{asset}', asset).replace('{tech_specs}', tech).replace('{ai_data}', f"\n\n{ai_data}")
+            # Only include AI Data if it has data
+            if ai_data:
+                prompt = custom_prompt.replace('{asset}', asset).replace('{tech_specs}', tech).replace('{ai_data}', f"\n\n{ai_data}")
+            else:
+                prompt = custom_prompt.replace('{asset}', asset).replace('{tech_specs}', tech).replace('{ai_data}', '')
             # Remove any remaining variable placeholders if not used
             prompt = prompt.replace('{comparable}', '')
         else:
             # Default prompt
+            ai_data_section = f"\n\nAI Data:\n{ai_data}" if ai_data else ""
             prompt = (
             "You are a technical documentation engineer writing for an industrial machinery catalog. "
             "For each item below, generate a single, objective technical description (200–250 words).\n"
@@ -209,13 +220,13 @@ async def build_description(rows, col_indices, session_id=None, custom_prompt=No
             "- Immediately state its primary industrial application (e.g., 'engineered for quarry loading', 'designed for earthmoving in construction sites').\n"
             "- Then describe technical systems in prose: engine, transmission, hydraulics, capacities, dimensions, etc. — only if present in input.\n"
             "- Integrate specs into sentences (e.g., 'Powered by a... delivering... hp').\n"
-            "- Use information from both Raw Trusted Data and AI Data sections.\n"
+            "- Use information from Raw Trusted Data" + (" and AI Data sections" if ai_data else "") + ".\n"
             "- NEVER use subjective, promotional, or evaluative language (e.g., 'robust', 'powerful', 'efficient', 'top-performing').\n"
             "- Use only facts from 'Raw' or 'Clean' input. Do not invent data.\n"
             "- Output must be one paragraph. No bullets, dashes, markdown, or lists.\n"
             "- Output ONLY the description. No other text.\n\n"
             f"Asset Name: {asset}\n\n"
-            f"Raw input:\n{raw_input}"
+            f"Raw Trusted Data:\n{tech}{ai_data_section}"
         )
         
         try:

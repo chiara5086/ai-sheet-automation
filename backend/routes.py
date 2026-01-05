@@ -116,7 +116,8 @@ def sheet_preview(sheet_url: str = Query(..., description="Google Sheet URL"), s
         sheet_name = find_structured_data_tab(sheet_id)
         print(f"DEBUG: Auto-detected tab: {sheet_name}")
     
-    range_name = f"{sheet_name}!A2:1000" if sheet_name else "A2:1000"
+    # Use a large range to read all rows (Google Sheets API only returns rows with data)
+    range_name = f"{sheet_name}!A2:Z100000" if sheet_name else "A2:Z100000"
     data = get_sheet_data(sheet_id, range_name)
     return {
         "headers": data[0] if data else [], 
@@ -163,7 +164,8 @@ async def process_step(request: ProcessRequest):
             raise HTTPException(status_code=400, detail="Could not find 'Structured Data' tab in sheet")
         
         # Fetch headers and rows (headers in row 2, data from row 3)
-        range_name = f"{sheet_name}!A2:1000"
+        # Use a large range to read all rows (Google Sheets API only returns rows with data)
+        range_name = f"{sheet_name}!A2:Z100000"
         print(f"DEBUG: Reading from range: {range_name}", flush=True)
         print(f"DEBUG: Calling get_sheet_data...", flush=True)
         data = get_sheet_data(sheetId, range_name)
