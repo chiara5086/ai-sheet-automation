@@ -18,7 +18,7 @@ import NavigationBar from '../components/NavigationBar';
 import StepSelector from '../components/StepSelector';
 import InstructionsCard from '../components/InstructionsCard';
 import { DEFAULT_PROMPTS } from '../components/PromptEditor';
-import { fetchSheetPreview, runProcessStep, saveHistory } from '../api';
+import { fetchSheetPreview, runProcessStep, saveHistory, cancelProcess } from '../api';
 import { useNotificationContext } from '../context/NotificationContext';
 
 const STEPS = [
@@ -986,7 +986,7 @@ export default function Home() {
     }
   };
 
-  const handleCancelProcess = (processId) => {
+  const handleCancelProcess = async (processId) => {
     const abortController = processAbortControllersRef.current[processId];
     if (abortController) {
       abortController.abort();
@@ -996,6 +996,13 @@ export default function Home() {
     setProcesses(prev => {
       const process = prev[processId];
       if (!process) return prev;
+
+      // Cancel process on backend
+      if (process.sessionId) {
+        cancelProcess(process.sessionId).catch(err => {
+          console.error('Error cancelling process on backend:', err);
+        });
+      }
 
       // Stop timer
       if (processTimersRef.current[processId]) {

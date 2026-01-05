@@ -702,6 +702,23 @@ async def get_active_sessions_endpoint():
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=error_msg)
 
+@router.post("/cancel-process/{session_id}")
+async def cancel_process_endpoint(session_id: str):
+    """
+    Cancel a running process by session_id
+    """
+    try:
+        from websocket_manager import manager
+        manager.cancel_session(session_id)
+        print(f"DEBUG: Process cancellation requested for session {session_id}", flush=True)
+        return {"status": "ok", "message": f"Process {session_id} marked for cancellation"}
+    except Exception as e:
+        import traceback
+        error_msg = f"Error cancelling process: {str(e)}"
+        print(f"❌ {error_msg}", flush=True)
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=error_msg)
+
 @router.get("/active-processes")
 async def get_active_processes_endpoint():
     """

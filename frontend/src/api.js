@@ -135,3 +135,13 @@ export const deleteActiveProcess = async (processId) => {
     throw error;
   }
 };
+
+export const cancelProcess = async (sessionId) => {
+  try {
+    const response = await axios.post(`${API_BASE}/cancel-process/${sessionId}`);
+    return response.data;
+  } catch (error) {
+    console.error('Error cancelling process:', error);
+    throw error;
+  }
+};

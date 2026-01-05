@@ -183,6 +183,12 @@ async def build_description(rows, col_indices, session_id=None, custom_prompt=No
     
     async def process_single_row(row_data):
         """Process a single row asynchronously."""
+        # Check if process was cancelled before processing
+        if session_id:
+            from websocket_manager import manager
+            if manager.is_cancelled(session_id):
+                return None  # Return None to skip this row
+        
         i, row, row_num, asset, tech, ai_data = row_data
         
         # Log that AI Data is being used (for first row only to avoid spam)
@@ -310,8 +316,20 @@ async def build_description(rows, col_indices, session_id=None, custom_prompt=No
     async def process_all_batches():
         """Process all rows in batches."""
         all_results = []
+        from websocket_manager import manager
         
         for batch_num in range(total_batches):
+            # Check if process was cancelled
+            if session_id and manager.is_cancelled(session_id):
+                print(f"DEBUG: Process cancelled by user, stopping at batch {batch_num + 1}/{total_batches}", flush=True)
+                if session_id:
+                    await manager.broadcast_to_session(session_id, {
+                        "type": "cancelled",
+                        "step": "Build Description",
+                        "message": "Process was cancelled by user"
+                    })
+                break
+            
             start_idx = batch_num * BATCH_SIZE
             end_idx = min(start_idx + BATCH_SIZE, total_to_process)
             batch = rows_to_process[start_idx:end_idx]
@@ -544,6 +562,14 @@ def ai_source_comparables(rows, col_indices, custom_prompt=None, session_id=None
     print(f"DEBUG: Using model: {model_name}")
     
     for i, row in enumerate(rows):
+        # Check if process was cancelled
+        if session_id:
+            from websocket_manager import manager
+            if manager.is_cancelled(session_id):
+                print(f"DEBUG: Process cancelled by user, stopping at row {i + 1}/{len(rows)}", flush=True)
+                # Note: Cancellation message will be handled by routes.py when it detects the cancellation
+                break
+        
         if i > 0 and i % 10 == 0:
             print(f"DEBUG: Processed {i}/{len(rows)} rows so far...")
         row_num = i + 3  # Row number in sheet (1-indexed, starting from row 3)

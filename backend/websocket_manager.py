@@ -9,6 +9,7 @@ from fastapi import WebSocket
 class ConnectionManager:
     def __init__(self):
         self.active_connections: Dict[str, Set[WebSocket]] = {}
+        self.cancelled_sessions: Set[str] = set()  # Track cancelled session IDs
     
     async def connect(self, websocket: WebSocket, session_id: str):
         await websocket.accept()
@@ -84,6 +85,19 @@ class ConnectionManager:
             print(f"DEBUG: Broadcast complete - sent to {sent_count} connection(s), removed {len(disconnected)} disconnected", flush=True)
         else:
             print(f"DEBUG: No active connections found for session {session_id}", flush=True)
+    
+    def cancel_session(self, session_id: str):
+        """Mark a session as cancelled"""
+        self.cancelled_sessions.add(session_id)
+        print(f"DEBUG: Session {session_id} marked as cancelled", flush=True)
+    
+    def is_cancelled(self, session_id: str) -> bool:
+        """Check if a session is cancelled"""
+        return session_id in self.cancelled_sessions
+    
+    def clear_cancelled(self, session_id: str):
+        """Clear cancelled status for a session (if needed)"""
+        self.cancelled_sessions.discard(session_id)
 
 manager = ConnectionManager()
 
