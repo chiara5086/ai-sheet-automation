@@ -90,6 +90,27 @@ else:
 
 GOOGLE_SERVICE_ACCOUNT_JSON = os.getenv('GOOGLE_SERVICE_ACCOUNT_JSON')
 
+GEMINI_API_KEY = os.getenv('GEMINI_API_KEY')
+if GEMINI_API_KEY:
+    GEMINI_API_KEY = GEMINI_API_KEY.strip()
+    # Remove quotes if present
+    if GEMINI_API_KEY.startswith('"') and GEMINI_API_KEY.endswith('"'):
+        GEMINI_API_KEY = GEMINI_API_KEY[1:-1].strip()
+    if GEMINI_API_KEY.startswith("'") and GEMINI_API_KEY.endswith("'"):
+        GEMINI_API_KEY = GEMINI_API_KEY[1:-1].strip()
+    
+    # Debug logging for Gemini key
+    if GEMINI_API_KEY:
+        key_preview = f"{GEMINI_API_KEY[:10]}...{GEMINI_API_KEY[-4:]}" if len(GEMINI_API_KEY) > 14 else "***"
+        print(f"[OK] Gemini API key loaded")
+        print(f"   Preview: {key_preview}")
+        print(f"   Length: {len(GEMINI_API_KEY)} characters")
+        print(f"   Starts with 'AIzaSy': {GEMINI_API_KEY.startswith('AIzaSy')}")
+    else:
+        print("[WARNING] GEMINI_API_KEY found but empty after cleaning")
+else:
+    print("[ERROR] GEMINI_API_KEY not found in environment variables")
+
 # Debug logging (without exposing the actual key)
 print(f"\n{'='*60}")
 print("DEBUG: Environment Configuration")
@@ -120,5 +141,17 @@ else:
     print("[ERROR] PERPLEXITY_API_KEY not found in environment variables")
     print("   Check your .env file in the backend directory")
     print(f"   Looking for PERPLEXITY_API_KEY in .env at: {env_file}")
+
+# Check Gemini key
+print()  # Empty line for readability
+if GEMINI_API_KEY:
+    key_preview = f"{GEMINI_API_KEY[:10]}...{GEMINI_API_KEY[-4:]}" if len(GEMINI_API_KEY) > 14 else "***"
+    print(f"[OK] Gemini API key loaded")
+    print(f"   Preview: {key_preview}")
+    print(f"   Length: {len(GEMINI_API_KEY)} characters")
+    print(f"   Starts with 'AIzaSy': {GEMINI_API_KEY.startswith('AIzaSy')}")
+else:
+    print("[ERROR] GEMINI_API_KEY not found in environment variables")
+    print("   Check your .env file in the backend directory")
 
 print(f"{'='*60}\n")

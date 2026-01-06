@@ -6,6 +6,466 @@ Contains modular functions for each process step in the asset sheet automation w
 All functions are documented and separated for clarity and maintainability.
 """
 
+import re
+
+def clean_ai_data_response(text):
+    """
+    Clean AI data response by removing unwanted elements:
+    - Navigation links like "(See all... for sale)"
+    - Text in square brackets like "[Raw Trusted Data]"
+    - Category/MANUFACTURER/MODEL header lines that don't contain specs
+    - Any other navigation or meta-text
+    """
+    if not text:
+        return text
+    
+    lines = text.split('\n')
+    cleaned_lines = []
+    
+    for line in lines:
+        original_line = line.strip()
+        if not original_line:
+            continue
+        
+        # Remove text in square brackets (e.g., "[Raw Trusted Data]")
+        line = re.sub(r'\[.*?\]', '', line)
+        
+        # Remove navigation links in parentheses - be more aggressive
+        line = re.sub(r'\(See all.*?\)', '', line, flags=re.IGNORECASE)
+        line = re.sub(r'\(See all.*?for sale\)', '', line, flags=re.IGNORECASE)
+        line = re.sub(r'\(View.*?\)', '', line, flags=re.IGNORECASE)
+        line = re.sub(r'\(.*?for sale.*?\)', '', line, flags=re.IGNORECASE)
+        line = re.sub(r'\(.*?Equipment for sale.*?\)', '', line, flags=re.IGNORECASE)
+        
+        # Remove entire lines that are only category headers without specs
+        # These are lines that start with **CATEGORY:**, **MANUFACTURER:**, or **MODEL:** 
+        # and don't contain actual specification values
+        if re.match(r'^\s*\*\*?(CATEGORY|MANUFACTURER|MODEL):\*\*?\s*', line, re.IGNORECASE):
+            # Check if it contains actual specs (numbers, units, etc.)
+            has_specs = bool(re.search(r'\d+\s*(hp|kw|lbs|ft|in|gal|gpm|psi|deg|mph|kph|cu\s*(yd|in)|rpm|amps|volts)', line, re.IGNORECASE))
+            if not has_specs:
+                continue  # Skip this line, it's just a header
+        
+        # Remove any remaining navigation text patterns
+        line = re.sub(r'See all.*?for sale', '', line, flags=re.IGNORECASE)
+        line = re.sub(r'See all.*?Equipment', '', line, flags=re.IGNORECASE)
+        
+        # Clean up any remaining extra spaces
+        line = re.sub(r'\s+', ' ', line).strip()
+        
+        # Remove lines that are too short or are just navigation text
+        if len(line) < 3:
+            continue
+        
+        # Only add lines that look like actual specifications
+        # They should contain numbers or be bullet points with content
+        # Be less strict - accept any line that has content and looks like a spec
+        if (line.startswith('-') or line.startswith('*') or 
+            re.search(r'\d+', line) or 
+            (len(line) > 10 and ':' in line)):  # Also accept lines with colons (spec: value format)
+            cleaned_lines.append(line)
+    
+    # Join lines back together
+    cleaned_text = '\n'.join(cleaned_lines)
+    
+    # Final cleanup: preserve line breaks but clean up excessive spacing
+    # Only collapse multiple spaces within a line, not across lines
+    lines = cleaned_text.split('\n')
+    cleaned_lines_final = []
+    for line in lines:
+        # Collapse multiple spaces to single space within each line
+        line = re.sub(r' +', ' ', line.strip())
+        if line:  # Only add non-empty lines
+            cleaned_lines_final.append(line)
+    
+    cleaned_text = '\n'.join(cleaned_lines_final)
+    
+    # Remove excessive blank lines (more than 2 consecutive newlines)
+    cleaned_text = re.sub(r'\n\n\n+', '\n\n', cleaned_text)
+    
+    return cleaned_text.strip()
+
+async def generate_ai_data(rows, col_indices, session_id=None, custom_prompt=None):
+    """
+    Step 0: Generate AI Data
+    
+    Searches for official OEM technical specifications using Gemini.
+    Fills the 'AI Data' column with verified technical specifications.
+    Only processes rows where 'AI Data' is empty.
+    
+    Args:
+        rows: List of data rows from the sheet
+        col_indices: Dictionary mapping column names to their indices
+        session_id: Optional session ID for WebSocket progress updates
+        custom_prompt: Optional custom prompt to use instead of default
+        
+    Returns:
+        tuple: (updated_rows, errors, stats)
+            - updated_rows: List of rows with updated AI Data values
+            - errors: List of error messages encountered during processing
+            - stats: Dictionary with processing statistics
+    """
+    print("DEBUG: generate_ai_data function called")
+    import google.generativeai as genai
+    from config import GEMINI_API_KEY
+    import re
+    
+    # Gemini is required for this step
+    if not GEMINI_API_KEY:
+        error_msg = 'Gemini API key required. Please set GEMINI_API_KEY in your .env file.'
+        print(f"ERROR: {error_msg}")
+        return rows, [error_msg], {"total": len(rows), "processed": 0, "success": 0, "skipped": 0, "errors_count": 1}
+    
+    api_key_clean = GEMINI_API_KEY.strip()
+    # Remove quotes if present
+    if api_key_clean.startswith('"') and api_key_clean.endswith('"'):
+        api_key_clean = api_key_clean[1:-1].strip()
+    if api_key_clean.startswith("'") and api_key_clean.endswith("'"):
+        api_key_clean = api_key_clean[1:-1].strip()
+    
+    # Gemini API keys start with "AIzaSy"
+    if not api_key_clean or len(api_key_clean) <= 10 or not api_key_clean.startswith('AIzaSy'):
+        error_msg = 'Invalid Gemini API key. Keys must start with "AIzaSy" and be at least 10 characters long.'
+        print(f"ERROR: {error_msg}")
+        return rows, [error_msg], {"total": len(rows), "processed": 0, "success": 0, "skipped": 0, "errors_count": 1}
+    
+    key_preview = f"{api_key_clean[:10]}...{api_key_clean[-4:]}" if len(api_key_clean) > 14 else "***"
+    print(f"DEBUG: ✅ Using Gemini API for AI Data generation (key preview: {key_preview}, length: {len(api_key_clean)})")
+    
+    try:
+        print(f"DEBUG: Initializing Gemini client...")
+        genai.configure(api_key=api_key_clean)
+        print(f"DEBUG: Gemini client initialized successfully")
+    except Exception as e:
+        error_msg = f'Failed to initialize API client: {str(e)}'
+        print(f"ERROR: {error_msg}")
+        return rows, [error_msg], {"total": len(rows), "processed": 0, "success": 0, "skipped": 0, "errors_count": 1}
+    
+    errors = []
+    
+    # Find asset column: starts with "YOM > OEM > MODEL"
+    asset_name_key = 'YOM > OEM > MODEL'
+    asset_idx = col_indices.get(asset_name_key)
+    if asset_idx is None:
+        # Fallback: try to find by pattern matching
+        for k, idx in col_indices.items():
+            if idx is None:
+                continue
+            norm_key = ''.join(k.lower().split())
+            # Check if it starts with "yom>oem>model"
+            if norm_key.startswith('yom>oem>model'):
+                asset_idx = idx
+                print(f"DEBUG: Found asset column using key '{k}' at index {idx}")
+                break
+    
+    # Get other column indices
+    tech_idx = col_indices.get('Raw Trusted Data')
+    ai_data_idx = col_indices.get('AI Data')
+    
+    print(f"DEBUG: Column indices found:")
+    print(f"  Asset (YOM > OEM > MODEL): {asset_idx}")
+    print(f"  Raw Trusted Data: {tech_idx}")
+    print(f"  AI Data: {ai_data_idx}")
+    
+    # Check required columns
+    if asset_idx is None or tech_idx is None or ai_data_idx is None:
+        error_msg = f'Missing required columns. Found: asset_idx={asset_idx}, tech_idx={tech_idx}, ai_data_idx={ai_data_idx}'
+        errors.append(error_msg)
+        print(f"ERROR: {error_msg}")
+        return rows, errors, {"total": len(rows), "processed": 0, "success": 0, "skipped": 0, "errors_count": len(errors)}
+    
+    def safe_get_cell(row, idx):
+        """Safely extract cell value."""
+        if idx is None:
+            return ''
+        if len(row) <= idx:
+            return ''
+        value = row[idx]
+        if value is None:
+            return ''
+        return str(value).strip()
+    
+    def is_ai_data_cell_empty(row, ai_data_idx):
+        """Check if AI Data cell is empty."""
+        if ai_data_idx is None or len(row) <= ai_data_idx:
+            return True
+        ai_data_value = row[ai_data_idx]
+        if ai_data_value is None:
+            return True
+        return not str(ai_data_value).strip()
+    
+    skipped_filled = 0
+    skipped_missing_data = 0
+    
+    # Collect rows that need processing
+    rows_to_process = []
+    for i, row in enumerate(rows):
+        row_num = i + 3
+        # Skip if already filled
+        if not is_ai_data_cell_empty(row, ai_data_idx):
+            skipped_filled += 1
+            continue
+        
+        # Get asset name and technical specs
+        asset = safe_get_cell(row, asset_idx)
+        tech = safe_get_cell(row, tech_idx)
+        
+        # Skip if required data is missing
+        if not asset:
+            skipped_missing_data += 1
+            continue
+        
+        rows_to_process.append((i, row, row_num, asset, tech))
+    
+    total_to_process = len(rows_to_process)
+    print(f"DEBUG: Starting to process {total_to_process} rows (out of {len(rows)} total) for AI Data generation...")
+    print(f"DEBUG: Skipped {skipped_filled} rows (already filled), {skipped_missing_data} rows (missing data)")
+    
+    # Process in parallel batches of 20
+    import asyncio
+    
+    async def process_single_row(row_data):
+        """Process a single row asynchronously."""
+        # Check if process was cancelled before processing
+        if session_id:
+            from websocket_manager import manager
+            if manager.is_cancelled(session_id):
+                return None  # Return None to skip this row
+        
+        i, row, row_num, asset, tech = row_data
+        
+        # Build prompt - use custom if provided, otherwise use default
+        if custom_prompt:
+            prompt = custom_prompt.replace('{asset}', asset).replace('{tech_specs}', tech)
+            prompt = prompt.replace('{ai_data}', '').replace('{comparable}', '')
+        else:
+            prompt = f"""Search the web for the official OEM technical specifications for the exact model provided.
+Use ONLY information that appears explicitly on verified sources such as the OEM's website,
+official brochures, or reputable equipment databases.
+NO GUESSING, NO INFERENCES, NO ASSUMPTIONS.
+If verified information cannot be found, respond only with: 'No official OEM specifications found.'
+Otherwise, list the technical specifications in bullet format exactly as published.
+Do not convert units, do not rewrite specs, do not add commentary.
+
+CRITICAL FORMATTING REQUIREMENTS:
+- Use bullet points with dashes: "- [Spec Name]: [Value]"
+- Each specification must be on a separate line
+- Use line breaks between different specification categories
+- Do NOT use markdown formatting (no **, no *, no bold)
+- Do NOT put multiple specs on the same line
+- Format example:
+  - Engine: 50 hp
+  - Weight: 5000 lbs
+  - Length: 10 ft
+
+Reference information (these values will be automatically filled from the sheet columns):
+Asset Name: {asset}
+Raw Trusted Data: {tech}"""
+        
+        try:
+            # Run Gemini API call in executor to make it async-compatible
+            loop = asyncio.get_event_loop()
+            
+            # Gemini doesn't have native async, so we run it in executor
+            def call_gemini():
+                model = genai.GenerativeModel('gemini-2.5-flash')
+                response = model.generate_content(
+                    prompt,
+                    generation_config=genai.types.GenerationConfig(
+                        temperature=0.3,
+                        max_output_tokens=2000,
+                    )
+                )
+                return response.text if response.text else ""
+            
+            ai_data_text = await loop.run_in_executor(None, call_gemini)
+            ai_data_text = ai_data_text.strip()
+            
+            # Filter out explanatory responses
+            is_explanation = any(phrase in ai_data_text.lower() for phrase in [
+                "i need to clarify", "i cannot", "limitation", "i appreciate",
+                "i need to", "according to my instructions", "would you like me",
+                "cannot generate", "do not contain", "search results provided"
+            ])
+            
+            if ai_data_text and not is_explanation:
+                # Clean the response: remove unwanted elements
+                cleaned_text = clean_ai_data_response(ai_data_text)
+                
+                # Only save if we have meaningful content after cleaning
+                # Lowered threshold from 20 to 10 characters to be less strict
+                if cleaned_text and cleaned_text.strip() and len(cleaned_text.strip()) > 10:
+                    # Ensure row has enough columns
+                    while len(row) <= ai_data_idx:
+                        row.append("")
+                    row[ai_data_idx] = cleaned_text
+                    return (i, row_num, cleaned_text, None)
+                else:
+                    # Log what was filtered out for debugging
+                    print(f"⚠️ Row {row_num}: Filtered out response (length: {len(cleaned_text.strip()) if cleaned_text else 0}): {cleaned_text[:100] if cleaned_text else 'None'}...")
+                    return (i, row_num, None, None)  # No meaningful data after cleaning
+            else:
+                return (i, row_num, None, None)  # No data found, but not an error
+        except Exception as e:
+            error_detail = str(e)
+            error_code = None
+            
+            if hasattr(e, 'status_code'):
+                error_code = e.status_code
+            elif hasattr(e, 'response') and hasattr(e.response, 'status_code'):
+                error_code = e.response.status_code
+            
+            return (i, row_num, None, (error_code, error_detail))
+    
+    # Process in batches of 20
+    BATCH_SIZE = 20
+    total_batches = (total_to_process + BATCH_SIZE - 1) // BATCH_SIZE
+    
+    # Shared counter for progress updates (thread-safe using asyncio.Lock)
+    progress_counter = {"success": 0, "errors": 0}
+    progress_lock = asyncio.Lock()
+    
+    async def process_single_row_with_progress(row_data):
+        """Process a single row and send individual progress update."""
+        result = await process_single_row(row_data)
+        
+        # Update counter atomically and send progress update for each completed row
+        async with progress_lock:
+            if result and result[2] is not None:  # Success
+                progress_counter["success"] += 1
+            elif result and result[3] is not None:  # Error
+                progress_counter["errors"] += 1
+            
+            # Send individual progress update
+            if session_id:
+                try:
+                    from websocket_manager import manager
+                    await manager.broadcast_to_session(session_id, {
+                        "type": "progress",
+                        "step": "Generate AI Data",
+                        "total": len(rows),
+                        "processed": progress_counter["success"] + progress_counter["errors"],
+                        "success": progress_counter["success"],
+                        "errors": progress_counter["errors"],
+                        "skipped": skipped_filled,
+                    })
+                    print(f"DEBUG: Sent progress update: success={progress_counter['success']}, errors={progress_counter['errors']}, total={len(rows)}")
+                except Exception as e:
+                    print(f"DEBUG: Failed to send progress update: {e}")
+        
+        return result
+    
+    async def process_batch(batch, batch_num, total_batches):
+        """Process a batch of rows in parallel with individual progress updates."""
+        print(f"DEBUG: Processing batch {batch_num}/{total_batches} ({len(batch)} rows)...")
+        tasks = [process_single_row_with_progress(row_data) for row_data in batch]
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        return results
+    
+    async def process_all_batches():
+        """Process all rows in batches."""
+        all_results = []
+        from websocket_manager import manager
+        
+        for batch_num in range(total_batches):
+            # Check if process was cancelled
+            if session_id and manager.is_cancelled(session_id):
+                print(f"DEBUG: Process cancelled by user, stopping at batch {batch_num + 1}/{total_batches}", flush=True)
+                if session_id:
+                    await manager.broadcast_to_session(session_id, {
+                        "type": "cancelled",
+                        "step": "Generate AI Data",
+                        "message": "Process was cancelled by user"
+                    })
+                break
+            
+            start_idx = batch_num * BATCH_SIZE
+            end_idx = min(start_idx + BATCH_SIZE, total_to_process)
+            batch = rows_to_process[start_idx:end_idx]
+            
+            batch_results = await process_batch(batch, batch_num + 1, total_batches)
+            all_results.extend(batch_results)
+            
+            processed_in_batch = sum(1 for r in batch_results if r and r[2] is not None)
+            print(f"DEBUG: Batch {batch_num + 1}/{total_batches} completed: {processed_in_batch}/{len(batch)} rows processed")
+        
+        return all_results
+    
+    # Run async processing
+    try:
+        results = await process_all_batches()
+    except Exception as e:
+        error_msg = f'Failed to process batches: {str(e)}'
+        print(f"ERROR: {error_msg}")
+        return rows, [error_msg], {"total": len(rows), "processed": 0, "success": 0, "skipped": skipped_filled + skipped_missing_data, "errors_count": 1}
+    
+    # Process results
+    success_count = 0
+    no_data_count = 0  # Count rows that returned no meaningful data after cleaning
+    for result in results:
+        if isinstance(result, Exception):
+            errors.append(f'Batch processing error: {str(result)}')
+            continue
+        
+        if result is None:
+            continue
+        
+        i, row_num, ai_data_text, error_info = result
+        
+        if error_info:
+            error_code, error_detail = error_info
+            # Critical errors: stop processing immediately
+            if error_code in [400, 401, 429]:
+                if error_code == 401:
+                    error_msg = f"CRITICAL: API authentication failed. Please check your API key. Error: {error_detail}"
+                elif error_code == 400:
+                    error_msg = f"CRITICAL: Invalid API request. Error: {error_detail}"
+                elif error_code == 429:
+                    error_msg = f"CRITICAL: API quota exceeded. Please check your API credits. Error: {error_detail}"
+                else:
+                    error_msg = f"CRITICAL: API error (code {error_code}). Error: {error_detail}"
+                
+                print(f"❌ {error_msg}")
+                errors.append(error_msg)
+                # Stop processing on critical errors
+                return rows, errors, {
+                    "total": len(rows),
+                    "processed": total_to_process,
+                    "success": success_count,
+                    "skipped": skipped_filled + skipped_missing_data,
+                    "errors_count": len(errors)
+                }
+            
+            # Non-critical errors
+            error_msg = f'Row {row_num}: API error: {error_detail}'
+            errors.append(error_msg)
+            print(f"❌ {error_msg}")
+        elif ai_data_text:
+            success_count += 1
+            print(f"✅ Row {row_num}: Successfully generated AI Data ({len(ai_data_text)} chars)")
+        else:
+            # Row processed but no meaningful data after cleaning
+            no_data_count += 1
+            print(f"⚠️ Row {row_num}: No meaningful data found after processing (may have been filtered out)")
+    
+    print(f"\n📊 Processing Summary:")
+    print(f"  - Total rows processed: {len(rows)}")
+    print(f"  - Rows with empty AI Data (candidates): {total_to_process + skipped_filled}")
+    print(f"  - Rows skipped (already have AI Data): {skipped_filled}")
+    print(f"  - Rows skipped (missing data): {skipped_missing_data}")
+    print(f"  - Rows successfully filled with AI Data: {success_count}")
+    print(f"  - Rows with no meaningful data after cleaning: {no_data_count}")
+    print(f"  - Errors encountered: {len(errors)}")
+    
+    return rows, errors, {
+        "total": len(rows),
+        "processed": total_to_process,
+        "success": success_count,
+        "skipped": skipped_filled + skipped_missing_data + no_data_count,
+        "errors_count": len(errors)
+    }
+
+
 async def build_description(rows, col_indices, session_id=None, custom_prompt=None):
     """
     Step 1: Build Description
@@ -27,73 +487,38 @@ async def build_description(rows, col_indices, session_id=None, custom_prompt=No
     """
     print("DEBUG: build_description function called")
     from openai import OpenAI
-    from config import OPENAI_API_KEY, PERPLEXITY_API_KEY
+    from config import PERPLEXITY_API_KEY
     import re
     
-    # Try Perplexity first (since user has credits there), fall back to OpenAI if Perplexity not available
-    use_perplexity = False
-    api_key_clean = None
+    # Perplexity is required for all steps
+    if not PERPLEXITY_API_KEY:
+        error_msg = 'Perplexity API key required. Please set PERPLEXITY_API_KEY in your .env file.'
+        print(f"ERROR: {error_msg}")
+        return rows, [error_msg]
     
-    if PERPLEXITY_API_KEY:
-        api_key_clean = PERPLEXITY_API_KEY.strip()
-        # Remove quotes if present
-        if api_key_clean.startswith('"') and api_key_clean.endswith('"'):
-            api_key_clean = api_key_clean[1:-1].strip()
-        if api_key_clean.startswith("'") and api_key_clean.endswith("'"):
-            api_key_clean = api_key_clean[1:-1].strip()
-        
-        # Perplexity API keys start with "pplx-"
-        if api_key_clean and len(api_key_clean) > 10:
-            if api_key_clean.startswith('pplx-'):
-                use_perplexity = True
-                key_preview = f"{api_key_clean[:10]}...{api_key_clean[-4:]}" if len(api_key_clean) > 14 else "***"
-                print(f"DEBUG: ✅ Using Perplexity API for description generation (key preview: {key_preview}, length: {len(api_key_clean)})")
-            else:
-                print(f"DEBUG: Perplexity API key found but doesn't start with 'pplx-', trying OpenAI...")
-        else:
-            print(f"DEBUG: Perplexity API key found but appears invalid (too short), trying OpenAI...")
+    api_key_clean = PERPLEXITY_API_KEY.strip()
+    # Remove quotes if present
+    if api_key_clean.startswith('"') and api_key_clean.endswith('"'):
+        api_key_clean = api_key_clean[1:-1].strip()
+    if api_key_clean.startswith("'") and api_key_clean.endswith("'"):
+        api_key_clean = api_key_clean[1:-1].strip()
     
-    # Fall back to OpenAI if Perplexity not available
-    if not use_perplexity:
-        if not OPENAI_API_KEY:
-            error_msg = 'Neither Perplexity nor OpenAI API key configured. Please set PERPLEXITY_API_KEY or OPENAI_API_KEY in your .env file.'
-            print(f"ERROR: {error_msg}")
-            return rows, [error_msg]
-        
-        api_key_clean = OPENAI_API_KEY.strip()
-        # Remove quotes and special characters
-        if api_key_clean.startswith('"') and api_key_clean.endswith('"'):
-            api_key_clean = api_key_clean[1:-1].strip()
-        if api_key_clean.startswith("'") and api_key_clean.endswith("'"):
-            api_key_clean = api_key_clean[1:-1].strip()
-        if api_key_clean.startswith('<') and api_key_clean.endswith('>'):
-            api_key_clean = api_key_clean[1:-1].strip()
-        
-        # Extract key if embedded in text
-        if not api_key_clean.startswith('sk-'):
-            match = re.search(r'sk-proj-[a-zA-Z0-9\-]{50,}', api_key_clean) or re.search(r'sk-[a-zA-Z0-9]{20,}', api_key_clean)
-            if match:
-                api_key_clean = match.group(0)
-        
-        if not api_key_clean.startswith('sk-'):
-            error_msg = f'OpenAI API key format appears invalid. Keys should start with "sk-" or "sk-proj-".'
-            print(f"ERROR: {error_msg}")
-            return rows, [error_msg]
-        
-        print(f"DEBUG: Using OpenAI API (key length: {len(api_key_clean)})")
+    # Perplexity API keys start with "pplx-"
+    if not api_key_clean or len(api_key_clean) <= 10 or not api_key_clean.startswith('pplx-'):
+        error_msg = 'Invalid Perplexity API key. Keys must start with "pplx-" and be at least 10 characters long.'
+        print(f"ERROR: {error_msg}")
+        return rows, [error_msg]
+    
+    key_preview = f"{api_key_clean[:10]}...{api_key_clean[-4:]}" if len(api_key_clean) > 14 else "***"
+    print(f"DEBUG: ✅ Using Perplexity API for description generation (key preview: {key_preview}, length: {len(api_key_clean)})")
     
     try:
-        if use_perplexity:
-            print(f"DEBUG: Initializing Perplexity client...")
-            client = OpenAI(
-                api_key=api_key_clean,
-                base_url="https://api.perplexity.ai"
-            )
-            print(f"DEBUG: Perplexity client initialized successfully")
-        else:
-            print(f"DEBUG: Initializing OpenAI client...")
-            client = OpenAI(api_key=api_key_clean)
-            print(f"DEBUG: OpenAI client initialized successfully")
+        print(f"DEBUG: Initializing Perplexity client...")
+        client = OpenAI(
+            api_key=api_key_clean,
+            base_url="https://api.perplexity.ai"
+        )
+        print(f"DEBUG: Perplexity client initialized successfully")
     except Exception as e:
         error_msg = f'Failed to initialize API client: {str(e)}'
         print(f"ERROR: {error_msg}")
@@ -215,31 +640,29 @@ async def build_description(rows, col_indices, session_id=None, custom_prompt=No
             # Remove any remaining variable placeholders if not used
             prompt = prompt.replace('{comparable}', '')
         else:
-            # Default prompt
-            ai_data_section = f"\n\nAI Data:\n{ai_data}" if ai_data else ""
-            prompt = (
-            "You are a technical documentation engineer writing for an industrial machinery catalog. "
-            "For each item below, generate a single, objective technical description (200–250 words).\n"
-            "Rules:\n"
-            "- Start with: 'The [Asset Name] is a...' where [Asset Name] MUST be taken verbatim from the Asset Name field. — Do NOT restate or reformat the name.\n"
-            "- Infer it from context if not explicit.\n"
-            "- Immediately state its primary industrial application (e.g., 'engineered for quarry loading', 'designed for earthmoving in construction sites').\n"
-            "- Then describe technical systems in prose: engine, transmission, hydraulics, capacities, dimensions, etc. — only if present in input.\n"
-            "- Integrate specs into sentences (e.g., 'Powered by a... delivering... hp').\n"
-            "- Use information from Raw Trusted Data" + (" and AI Data sections" if ai_data else "") + ".\n"
-            "- NEVER use subjective, promotional, or evaluative language (e.g., 'robust', 'powerful', 'efficient', 'top-performing').\n"
-            "- Use only facts from 'Raw' or 'Clean' input. Do not invent data.\n"
-            "- Output must be one paragraph. No bullets, dashes, markdown, or lists.\n"
-            "- Output ONLY the description. No other text.\n\n"
-            f"Asset Name: {asset}\n\n"
-            f"Raw Trusted Data:\n{tech}{ai_data_section}"
-        )
+            # Default prompt - matches frontend PromptEditor.js
+            ai_data_section = f"\nAI Data: {ai_data}" if ai_data else ""
+            prompt = f"""You are a technical documentation engineer writing for an industrial machinery catalog. For each item below, generate a single, objective technical description (200–250 words).
+Rules:
+- Start with: 'The [Asset Name] is a...' where [Asset Name] MUST be taken verbatim from the Asset Name field. — Do NOT restate or reformat the name.
+- Infer it from context if not explicit.
+- Immediately state its primary industrial application (e.g., 'engineered for quarry loading', 'designed for earthmoving in construction sites').
+- Then describe technical systems in prose: engine, transmission, hydraulics, capacities, dimensions, etc. — only if present in input.
+- Integrate specs into sentences (e.g., 'Powered by a... delivering... hp').
+- NEVER use subjective, promotional, or evaluative language (e.g., 'robust', 'powerful', 'efficient', 'top-performing').
+- Use only facts from 'Raw' or 'Clean' input. Do not invent data.
+- Output must be one paragraph. No bullets, dashes, markdown, or lists.
+- Output ONLY the description. No other text.
+
+Reference information (these values will be automatically filled from the sheet columns):
+Asset Name: {asset}
+Raw Trusted Data: {tech}{ai_data_section}"""
         
         try:
-            model_name = "sonar" if use_perplexity else "gpt-4o-mini"
+            model_name = "sonar"
             async_client = AsyncOpenAI(
                 api_key=api_key_clean,
-                base_url="https://api.perplexity.ai" if use_perplexity else None
+                base_url="https://api.perplexity.ai"
             )
             
             response = await async_client.chat.completions.create(
@@ -398,7 +821,7 @@ async def build_description(rows, col_indices, session_id=None, custom_prompt=No
     return rows, errors
 
 
-def ai_source_comparables(rows, col_indices, custom_prompt=None, session_id=None):
+async def ai_source_comparables(rows, col_indices, custom_prompt=None, session_id=None):
     """
     Step 2: AI Source Comparables
     
@@ -423,73 +846,38 @@ def ai_source_comparables(rows, col_indices, custom_prompt=None, session_id=None
     """
     print("DEBUG: ai_source_comparables function called")
     from openai import OpenAI
-    from config import OPENAI_API_KEY, PERPLEXITY_API_KEY
+    from config import PERPLEXITY_API_KEY
     import re
     
-    # Perplexity is required for web search
-    use_perplexity = False
-    api_key_clean = None
+    # Perplexity is required for all steps
+    if not PERPLEXITY_API_KEY:
+        error_msg = 'Perplexity API key required. Please set PERPLEXITY_API_KEY in your .env file.'
+        print(f"ERROR: {error_msg}")
+        return rows, [error_msg], {"total": len(rows), "processed": 0, "success": 0, "skipped": 0, "errors_count": 1}
     
-    if PERPLEXITY_API_KEY:
-        api_key_clean = PERPLEXITY_API_KEY.strip()
-        # Remove quotes if present
-        if api_key_clean.startswith('"') and api_key_clean.endswith('"'):
-            api_key_clean = api_key_clean[1:-1].strip()
-        if api_key_clean.startswith("'") and api_key_clean.endswith("'"):
-            api_key_clean = api_key_clean[1:-1].strip()
-        
-        # Perplexity API keys start with "pplx-"
-        if api_key_clean and len(api_key_clean) > 10:
-            if api_key_clean.startswith('pplx-'):
-                use_perplexity = True
-                key_preview = f"{api_key_clean[:10]}...{api_key_clean[-4:]}" if len(api_key_clean) > 14 else "***"
-                print(f"DEBUG: ✅ Using Perplexity API for comparables search (key preview: {key_preview}, length: {len(api_key_clean)})")
-            else:
-                print(f"DEBUG: Perplexity API key found but doesn't start with 'pplx-', trying OpenAI...")
-        else:
-            print(f"DEBUG: Perplexity API key found but appears invalid (too short), trying OpenAI...")
+    api_key_clean = PERPLEXITY_API_KEY.strip()
+    # Remove quotes if present
+    if api_key_clean.startswith('"') and api_key_clean.endswith('"'):
+        api_key_clean = api_key_clean[1:-1].strip()
+    if api_key_clean.startswith("'") and api_key_clean.endswith("'"):
+        api_key_clean = api_key_clean[1:-1].strip()
     
-    # Fall back to OpenAI if Perplexity not available (but web search won't work as well)
-    if not use_perplexity:
-        if not OPENAI_API_KEY:
-            error_msg = 'Perplexity API key required for web search. Please set PERPLEXITY_API_KEY in your .env file.'
-            print(f"ERROR: {error_msg}")
-            return rows, [error_msg]
-        
-        api_key_clean = OPENAI_API_KEY.strip()
-        # Remove quotes and special characters
-        if api_key_clean.startswith('"') and api_key_clean.endswith('"'):
-            api_key_clean = api_key_clean[1:-1].strip()
-        if api_key_clean.startswith("'") and api_key_clean.endswith("'"):
-            api_key_clean = api_key_clean[1:-1].strip()
-        if api_key_clean.startswith('<') and api_key_clean.endswith('>'):
-            api_key_clean = api_key_clean[1:-1].strip()
-        
-        # Extract key if embedded in text
-        if not api_key_clean.startswith('sk-'):
-            match = re.search(r'sk-proj-[a-zA-Z0-9\-]{50,}', api_key_clean) or re.search(r'sk-[a-zA-Z0-9]{20,}', api_key_clean)
-            if match:
-                api_key_clean = match.group(0)
-        
-        if not api_key_clean.startswith('sk-'):
-            error_msg = f'OpenAI API key format appears invalid. Keys should start with "sk-" or "sk-proj-".'
-            print(f"ERROR: {error_msg}")
-            return rows, [error_msg]
-        
-        print(f"DEBUG: Using OpenAI API (key length: {len(api_key_clean)}) - Note: web search may be limited")
+    # Perplexity API keys start with "pplx-"
+    if not api_key_clean or len(api_key_clean) <= 10 or not api_key_clean.startswith('pplx-'):
+        error_msg = 'Invalid Perplexity API key. Keys must start with "pplx-" and be at least 10 characters long.'
+        print(f"ERROR: {error_msg}")
+        return rows, [error_msg], {"total": len(rows), "processed": 0, "success": 0, "skipped": 0, "errors_count": 1}
+    
+    key_preview = f"{api_key_clean[:10]}...{api_key_clean[-4:]}" if len(api_key_clean) > 14 else "***"
+    print(f"DEBUG: ✅ Using Perplexity API for comparables search (key preview: {key_preview}, length: {len(api_key_clean)})")
     
     try:
-        if use_perplexity:
-            print(f"DEBUG: Initializing Perplexity client...")
-            client = OpenAI(
-                api_key=api_key_clean,
-                base_url="https://api.perplexity.ai"
-            )
-            print(f"DEBUG: Perplexity client initialized successfully")
-        else:
-            print(f"DEBUG: Initializing OpenAI client...")
-            client = OpenAI(api_key=api_key_clean)
-            print(f"DEBUG: OpenAI client initialized successfully")
+        print(f"DEBUG: Initializing Perplexity client...")
+        client = OpenAI(
+            api_key=api_key_clean,
+            base_url="https://api.perplexity.ai"
+        )
+        print(f"DEBUG: Perplexity client initialized successfully")
     except Exception as e:
         error_msg = f'Failed to initialize API client: {str(e)}'
         print(f"ERROR: {error_msg}")
@@ -550,38 +938,19 @@ def ai_source_comparables(rows, col_indices, custom_prompt=None, session_id=None
             return True
         return not str(comparable_value).strip()
     
-    processed_count = 0
     skipped_filled = 0
     skipped_missing_data = 0
-    success_count = 0
     
-    print(f"DEBUG: Starting to process {len(rows)} rows for comparables search...")
-    
-    # Use Perplexity model for web search
-    model_name = "sonar" if use_perplexity else "gpt-4o-mini"
-    print(f"DEBUG: Using model: {model_name}")
-    
+    # Collect rows that need processing
+    rows_to_process = []
     for i, row in enumerate(rows):
-        # Check if process was cancelled
-        if session_id:
-            from websocket_manager import manager
-            if manager.is_cancelled(session_id):
-                print(f"DEBUG: Process cancelled by user, stopping at row {i + 1}/{len(rows)}", flush=True)
-                # Note: Cancellation message will be handled by routes.py when it detects the cancellation
-                break
-        
-        if i > 0 and i % 10 == 0:
-            print(f"DEBUG: Processed {i}/{len(rows)} rows so far...")
-        row_num = i + 3  # Row number in sheet (1-indexed, starting from row 3)
-        
-        # Only process rows where AI Comparable Price cell is EMPTY
+        row_num = i + 3
+        # Skip if already filled
         if not is_comparable_cell_empty(row, comparable_idx):
             skipped_filled += 1
             continue
         
-        processed_count += 1
-        
-        # Extract required data
+        # Get asset name, technical specs, and AI data
         asset = safe_get_cell(row, asset_idx)
         tech = safe_get_cell(row, tech_idx)
         ai_data = safe_get_cell(row, ai_data_idx)
@@ -589,8 +958,31 @@ def ai_source_comparables(rows, col_indices, custom_prompt=None, session_id=None
         # Skip if required data is missing
         if not asset or not tech:
             skipped_missing_data += 1
-            print(f"DEBUG: Row {row_num}: Skipped - missing data (asset: {bool(asset)}, tech: {bool(tech)})")
             continue
+        
+        rows_to_process.append((i, row, row_num, asset, tech, ai_data))
+    
+    total_to_process = len(rows_to_process)
+    print(f"DEBUG: Starting to process {total_to_process} rows (out of {len(rows)} total) for comparables search...")
+    print(f"DEBUG: Skipped {skipped_filled} rows (already filled), {skipped_missing_data} rows (missing data)")
+    
+    # Process in parallel batches of 20
+    import asyncio
+    from openai import AsyncOpenAI
+    
+    # Use Perplexity model
+    model_name = "sonar"
+    print(f"DEBUG: Using model: {model_name}")
+    
+    async def process_single_row(row_data):
+        """Process a single row asynchronously."""
+        # Check if process was cancelled before processing
+        if session_id:
+            from websocket_manager import manager
+            if manager.is_cancelled(session_id):
+                return None  # Return None to skip this row
+        
+        i, row, row_num, asset, tech, ai_data = row_data
         
         # Build prompt - use custom if provided, otherwise use default
         if custom_prompt:
@@ -601,6 +993,8 @@ def ai_source_comparables(rows, col_indices, custom_prompt=None, session_id=None
                 prompt = prompt.replace('{ai_data}', '')
             prompt = prompt.replace('{comparable}', '')
         else:
+            # Default prompt - matches frontend PromptEditor.js
+            ai_data_section = f"\nAI Data: {ai_data}" if ai_data else ""
             prompt = f"""You are an expert in construction equipment valuation. Search the web thoroughly for comparable listings of this equipment. You MUST find and return at least 3-10 comparable listings if they exist online. For each comparable listing found, return ONLY: Condition, Price, and the Listing URL. Format each listing on one line exactly as: Condition: [condition], Price: [price], URL: [link]. 
 
 IMPORTANT: 
@@ -610,17 +1004,20 @@ IMPORTANT:
 - Only return listings that are actually for sale (not just specifications pages)
 - If you cannot find any comparables after thorough searching, return a brief explanation
 
-Asset: {asset}
-Raw Trusted Data: {tech}"""
-            if ai_data:
-                prompt += f"\nAI Data: {ai_data}"
+Reference information (these values will be automatically filled from the sheet columns):
+Asset Name: {asset}
+Raw Trusted Data: {tech}{ai_data_section}"""
         
         try:
-            print(f"DEBUG: Row {row_num}: Calling API for comparables search...")
-            response = client.chat.completions.create(
+            async_client = AsyncOpenAI(
+                api_key=api_key_clean,
+                base_url="https://api.perplexity.ai"
+            )
+            
+            response = await async_client.chat.completions.create(
                 model=model_name,
                 messages=[
-                    {"role": "system", "content": "You are an expert in construction equipment valuation. Your task is to search thoroughly across multiple equipment marketplaces and find as many comparable listings as possible. Always return listings in the exact format specified: Condition: [condition], Price: [price], URL: [link]. Search extensively - don't give up after finding just one or two listings."},
+                    {"role": "system", "content": "You are a construction equipment search tool. Search thoroughly across multiple marketplaces and return ONLY listings in the exact format: Condition: [condition], Price: [price], URL: [link]. If no listings found, return ONLY: 'No comparables found'. Never write explanations, disclaimers, or meta-commentary."},
                     {"role": "user", "content": prompt}
                 ],
                 temperature=0.3,
@@ -628,34 +1025,132 @@ Raw Trusted Data: {tech}"""
             )
             
             comparable_text = response.choices[0].message.content.strip()
-            print(f"DEBUG: Row {row_num}: API response length: {len(comparable_text)} chars")
             
-            if comparable_text:
+            # Filter out explanatory responses
+            is_explanation = any(phrase in comparable_text.lower() for phrase in [
+                "i need to clarify", "i cannot", "limitation", "i appreciate", 
+                "i need to", "according to my instructions", "would you like me",
+                "cannot generate", "do not contain", "search results provided"
+            ])
+            
+            # Check if response follows the expected format
+            has_valid_format = "condition:" in comparable_text.lower() and "price:" in comparable_text.lower()
+            
+            if comparable_text and not is_explanation and (has_valid_format or comparable_text.lower().startswith("no comparables found")):
                 # Ensure row has enough columns
                 while len(row) <= comparable_idx:
                     row.append("")
-                
-                # Store the comparable data
                 row[comparable_idx] = comparable_text
-                success_count += 1
-                print(f"✅ Row {row_num}: Successfully found comparables ({len(comparable_text)} chars)")
-                
-                # Send progress update every time we successfully fill a row
-                # Use a simple approach: store progress updates to send later
-                # (We'll send them from routes.py which is async)
+                return (i, row_num, comparable_text, None)
             else:
-                print(f"⚠️ Row {row_num}: No comparables found")
-        
+                return (i, row_num, None, None)  # No comparables found, but not an error
         except Exception as e:
             error_detail = str(e)
             error_code = None
             
-            # Check for API errors
             if hasattr(e, 'status_code'):
                 error_code = e.status_code
             elif hasattr(e, 'response') and hasattr(e.response, 'status_code'):
                 error_code = e.response.status_code
             
+            return (i, row_num, None, (error_code, error_detail))
+    
+    # Process in batches of 20
+    BATCH_SIZE = 20
+    total_batches = (total_to_process + BATCH_SIZE - 1) // BATCH_SIZE
+    
+    # Shared counter for progress updates (thread-safe using asyncio.Lock)
+    progress_counter = {"success": 0, "errors": 0}
+    progress_lock = asyncio.Lock()
+    
+    async def process_single_row_with_progress(row_data):
+        """Process a single row and send individual progress update."""
+        result = await process_single_row(row_data)
+        
+        # Update counter atomically and send progress update for each completed row
+        async with progress_lock:
+            if result and result[2] is not None:  # Success
+                progress_counter["success"] += 1
+            elif result and result[3] is not None:  # Error
+                progress_counter["errors"] += 1
+            
+            # Send individual progress update
+            if session_id:
+                try:
+                    from websocket_manager import manager
+                    await manager.broadcast_to_session(session_id, {
+                        "type": "progress",
+                        "step": "AI Source Comparables",
+                        "total": len(rows),
+                        "processed": progress_counter["success"] + progress_counter["errors"],
+                        "success": progress_counter["success"],
+                        "errors": progress_counter["errors"],
+                        "skipped": skipped_filled,
+                    })
+                    print(f"DEBUG: Sent progress update: success={progress_counter['success']}, errors={progress_counter['errors']}, total={len(rows)}")
+                except Exception as e:
+                    print(f"DEBUG: Failed to send progress update: {e}")
+        
+        return result
+    
+    async def process_batch(batch, batch_num, total_batches):
+        """Process a batch of rows in parallel with individual progress updates."""
+        print(f"DEBUG: Processing batch {batch_num}/{total_batches} ({len(batch)} rows)...")
+        tasks = [process_single_row_with_progress(row_data) for row_data in batch]
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        return results
+    
+    async def process_all_batches():
+        """Process all rows in batches."""
+        all_results = []
+        from websocket_manager import manager
+        
+        for batch_num in range(total_batches):
+            # Check if process was cancelled
+            if session_id and manager.is_cancelled(session_id):
+                print(f"DEBUG: Process cancelled by user, stopping at batch {batch_num + 1}/{total_batches}", flush=True)
+                if session_id:
+                    await manager.broadcast_to_session(session_id, {
+                        "type": "cancelled",
+                        "step": "AI Source Comparables",
+                        "message": "Process was cancelled by user"
+                    })
+                break
+            
+            start_idx = batch_num * BATCH_SIZE
+            end_idx = min(start_idx + BATCH_SIZE, total_to_process)
+            batch = rows_to_process[start_idx:end_idx]
+            
+            batch_results = await process_batch(batch, batch_num + 1, total_batches)
+            all_results.extend(batch_results)
+            
+            processed_in_batch = sum(1 for r in batch_results if r and r[2] is not None)
+            print(f"DEBUG: Batch {batch_num + 1}/{total_batches} completed: {processed_in_batch}/{len(batch)} rows processed")
+        
+        return all_results
+    
+    # Run async processing
+    try:
+        results = await process_all_batches()
+    except Exception as e:
+        error_msg = f'Failed to process batches: {str(e)}'
+        print(f"ERROR: {error_msg}")
+        return rows, [error_msg], {"total": len(rows), "processed": 0, "success": 0, "skipped": skipped_filled + skipped_missing_data, "errors_count": 1}
+    
+    # Process results
+    success_count = 0
+    for result in results:
+        if isinstance(result, Exception):
+            errors.append(f'Batch processing error: {str(result)}')
+            continue
+        
+        if result is None:
+            continue
+        
+        i, row_num, comparable_text, error_info = result
+        
+        if error_info:
+            error_code, error_detail = error_info
             # Critical errors: stop processing immediately
             if error_code in [400, 401, 429]:
                 if error_code == 401:
@@ -669,42 +1164,41 @@ Raw Trusted Data: {tech}"""
                 
                 print(f"❌ {error_msg}")
                 errors.append(error_msg)
-                # Stop processing on critical errors - return with current stats
+                # Stop processing on critical errors
                 return rows, errors, {
                     "total": len(rows),
-                    "processed": processed_count,
+                    "processed": total_to_process,
                     "success": success_count,
                     "skipped": skipped_filled + skipped_missing_data,
                     "errors_count": len(errors)
                 }
             
-            # Non-critical errors: log and continue
+            # Non-critical errors
             error_msg = f'Row {row_num}: API error: {error_detail}'
             errors.append(error_msg)
             print(f"❌ {error_msg}")
-    
-    # Calculate final statistics
-    row_errors = len([e for e in errors if 'Row' in e])
-    final_success = success_count
+        elif comparable_text:
+            success_count += 1
+            print(f"✅ Row {row_num}: Successfully found comparables ({len(comparable_text)} chars)")
     
     print(f"\n📊 Processing Summary:")
     print(f"  - Total rows processed: {len(rows)}")
-    print(f"  - Rows with empty AI Comparable Price (candidates): {processed_count + skipped_filled}")
+    print(f"  - Rows with empty AI Comparable Price (candidates): {total_to_process + skipped_filled}")
     print(f"  - Rows skipped (already have comparables): {skipped_filled}")
     print(f"  - Rows skipped (missing data): {skipped_missing_data}")
-    print(f"  - Rows successfully filled with comparables: {final_success}")
+    print(f"  - Rows successfully filled with comparables: {success_count}")
     print(f"  - Errors encountered: {len(errors)}")
     
     return rows, errors, {
         "total": len(rows),
-        "processed": processed_count,
-        "success": final_success,
+        "processed": total_to_process,
+        "success": success_count,
         "skipped": skipped_filled + skipped_missing_data,
         "errors_count": len(errors)
     }
 
 
-def extract_final_price(rows, col_indices, custom_prompt=None):
+async def extract_final_price(rows, col_indices, custom_prompt=None, session_id=None):
     """
     Step 3: Extract Price from AI Comparable
     
@@ -729,81 +1223,38 @@ def extract_final_price(rows, col_indices, custom_prompt=None):
     """
     print("DEBUG: extract_final_price function called")
     from openai import OpenAI
-    from config import OPENAI_API_KEY, PERPLEXITY_API_KEY
+    from config import PERPLEXITY_API_KEY
     import re
     
-    print("DEBUG: Imports successful, checking API key...")
-    print(f"DEBUG: PERPLEXITY_API_KEY exists: {PERPLEXITY_API_KEY is not None}")
-    if PERPLEXITY_API_KEY:
-        print(f"DEBUG: PERPLEXITY_API_KEY length: {len(PERPLEXITY_API_KEY)}")
-        print(f"DEBUG: PERPLEXITY_API_KEY starts with 'pplx-': {PERPLEXITY_API_KEY.startswith('pplx-')}")
-        print(f"DEBUG: PERPLEXITY_API_KEY preview: {PERPLEXITY_API_KEY[:10]}..." if len(PERPLEXITY_API_KEY) > 10 else "DEBUG: PERPLEXITY_API_KEY too short")
+    # Perplexity is required for all steps
+    if not PERPLEXITY_API_KEY:
+        error_msg = 'Perplexity API key required. Please set PERPLEXITY_API_KEY in your .env file.'
+        print(f"ERROR: {error_msg}")
+        return rows, [error_msg], []
     
-    # Try Perplexity first, fall back to OpenAI if Perplexity not available
-    use_perplexity = False
-    api_key_clean = None
+    api_key_clean = PERPLEXITY_API_KEY.strip()
+    # Remove quotes if present
+    if api_key_clean.startswith('"') and api_key_clean.endswith('"'):
+        api_key_clean = api_key_clean[1:-1].strip()
+    if api_key_clean.startswith("'") and api_key_clean.endswith("'"):
+        api_key_clean = api_key_clean[1:-1].strip()
     
-    if PERPLEXITY_API_KEY:
-        api_key_clean = PERPLEXITY_API_KEY.strip()
-        # Remove quotes if present
-        if api_key_clean.startswith('"') and api_key_clean.endswith('"'):
-            api_key_clean = api_key_clean[1:-1].strip()
-        if api_key_clean.startswith("'") and api_key_clean.endswith("'"):
-            api_key_clean = api_key_clean[1:-1].strip()
-        
-        # Perplexity API keys start with "pplx-"
-        if api_key_clean and len(api_key_clean) > 10:
-            if api_key_clean.startswith('pplx-'):
-                use_perplexity = True
-                key_preview = f"{api_key_clean[:10]}...{api_key_clean[-4:]}" if len(api_key_clean) > 14 else "***"
-                print(f"DEBUG: ✅ Using Perplexity API (key preview: {key_preview}, length: {len(api_key_clean)})")
-            else:
-                print(f"DEBUG: Perplexity API key found but doesn't start with 'pplx-', trying OpenAI...")
-        else:
-            print(f"DEBUG: Perplexity API key found but appears invalid (too short), trying OpenAI...")
+    # Perplexity API keys start with "pplx-"
+    if not api_key_clean or len(api_key_clean) <= 10 or not api_key_clean.startswith('pplx-'):
+        error_msg = 'Invalid Perplexity API key. Keys must start with "pplx-" and be at least 10 characters long.'
+        print(f"ERROR: {error_msg}")
+        return rows, [error_msg], []
     
-    # Fall back to OpenAI if Perplexity not available
-    if not use_perplexity:
-        if not OPENAI_API_KEY:
-            error_msg = 'Neither Perplexity nor OpenAI API key configured. Please set PERPLEXITY_API_KEY or OPENAI_API_KEY in your .env file.'
-            print(f"ERROR: {error_msg}")
-            return rows, [error_msg], []
-        
-        api_key_clean = OPENAI_API_KEY.strip()
-        # Remove quotes and special characters
-        if api_key_clean.startswith('"') and api_key_clean.endswith('"'):
-            api_key_clean = api_key_clean[1:-1].strip()
-        if api_key_clean.startswith("'") and api_key_clean.endswith("'"):
-            api_key_clean = api_key_clean[1:-1].strip()
-        if api_key_clean.startswith('<') and api_key_clean.endswith('>'):
-            api_key_clean = api_key_clean[1:-1].strip()
-        
-        # Extract key if embedded in text
-        if not api_key_clean.startswith('sk-'):
-            match = re.search(r'sk-proj-[a-zA-Z0-9\-]{50,}', api_key_clean) or re.search(r'sk-[a-zA-Z0-9]{20,}', api_key_clean)
-            if match:
-                api_key_clean = match.group(0)
-        
-        if not api_key_clean.startswith('sk-'):
-            error_msg = f'OpenAI API key format appears invalid. Keys should start with "sk-" or "sk-proj-".'
-            print(f"ERROR: {error_msg}")
-            return rows, [error_msg], []
-        
-        print(f"DEBUG: Using OpenAI API (key length: {len(api_key_clean)})")
+    key_preview = f"{api_key_clean[:10]}...{api_key_clean[-4:]}" if len(api_key_clean) > 14 else "***"
+    print(f"DEBUG: ✅ Using Perplexity API for price extraction (key preview: {key_preview}, length: {len(api_key_clean)})")
     
     try:
-        if use_perplexity:
-            # Perplexity uses OpenAI-compatible API but different base URL
-            print(f"DEBUG: Initializing Perplexity client...")
-            client = OpenAI(
-                api_key=api_key_clean,
-                base_url="https://api.perplexity.ai"
-            )
-            print(f"DEBUG: Perplexity client initialized successfully")
-        else:
-            print(f"DEBUG: Initializing OpenAI client...")
-            client = OpenAI(api_key=api_key_clean)
-            print(f"DEBUG: OpenAI client initialized successfully")
+        print(f"DEBUG: Initializing Perplexity client...")
+        client = OpenAI(
+            api_key=api_key_clean,
+            base_url="https://api.perplexity.ai"
+        )
+        print(f"DEBUG: Perplexity client initialized successfully")
     except Exception as e:
         error_msg = f'Failed to initialize API client: {str(e)}'
         print(f"ERROR: {error_msg}")
@@ -894,46 +1345,49 @@ def extract_final_price(rows, col_indices, custom_prompt=None):
         # Convert to string and strip whitespace
         return str(value).strip()
     
-    processed_count = 0
     skipped_empty_price = 0
     skipped_missing_data = 0
     
-    print(f"DEBUG: Starting to process {len(rows)} rows...")
-
+    # Collect rows that need processing
+    rows_to_process = []
     for i, row in enumerate(rows):
-        # Log progress every 10 rows
-        if i > 0 and i % 10 == 0:
-            print(f"DEBUG: Processed {i}/{len(rows)} rows so far...")
-        row_num = i + 3  # Row number in sheet (1-indexed, starting from row 3)
-        
-        # STEP 1: Only process rows where Price cell is EMPTY (we want to fill empty prices)
+        row_num = i + 3
+        # Skip if already filled
         if not is_price_cell_empty(row, price_idx):
             skipped_empty_price += 1
-            continue  # Skip rows that already have a price
+            continue
         
-        processed_count += 1
-        
-        # STEP 2: Extract required data from the row
-        # All columns are found by NAME, not by position, so they can be in any order
+        # Extract required data
         asset = safe_get_cell(row, asset_idx)
         tech = safe_get_cell(row, tech_idx)
-        ai_data = safe_get_cell(row, ai_data_idx)  # Optional but used if available
+        ai_data = safe_get_cell(row, ai_data_idx)
         comparable = safe_get_cell(row, comparable_idx)
         
-        # STEP 3: Skip if required data is missing (can't extract price without this info)
-        # Note: AI Data is optional, but Asset, Tech Specs, and Comparable are required
+        # Skip if required data is missing
         if not asset or not tech or not comparable:
             skipped_missing_data += 1
-            missing_fields = []
-            if not asset: missing_fields.append("Asset")
-            if not tech: missing_fields.append("Raw Trusted Data")
-            if not comparable: missing_fields.append("AI Comparable Price")
-            # Only log first few to avoid spam
-            if skipped_missing_data <= 5:
-                print(f"⚠️ Row {row_num}: Skipping - missing: {', '.join(missing_fields)}")
-            continue  # Skip rows with missing required data
+            continue
         
-        # Build prompt - use custom if provided, otherwise use default
+        rows_to_process.append((i, row, row_num, asset, tech, ai_data, comparable))
+    
+    total_to_process = len(rows_to_process)
+    print(f"DEBUG: Starting to process {total_to_process} rows (out of {len(rows)} total) for price extraction...")
+    print(f"DEBUG: Skipped {skipped_empty_price} rows (already filled), {skipped_missing_data} rows (missing data)")
+    
+    # Process in parallel batches of 20
+    import asyncio
+    from openai import AsyncOpenAI
+    
+    async def process_single_row(row_data):
+        """Process a single row asynchronously."""
+        if session_id:
+            from websocket_manager import manager
+            if manager.is_cancelled(session_id):
+                return None
+        
+        i, row, row_num, asset, tech, ai_data, comparable = row_data
+        
+        # Build prompt
         if custom_prompt:
             prompt = custom_prompt.replace('{asset}', asset).replace('{tech_specs}', tech).replace('{comparable}', comparable)
             if ai_data:
@@ -941,111 +1395,162 @@ def extract_final_price(rows, col_indices, custom_prompt=None):
             else:
                 prompt = prompt.replace('{ai_data}', '')
         else:
-            prompt = (
-                "You are an expert in construction equipment valuation. Read the asset details, technical specs, and comparable listings below. "
-            "Choose the single most relevant price, convert it to USD if needed, and return ONLY the final USD amount formatted like 'XXXXXX.XX'. "
-            "If no relevant price exists, return blank. Do not add any explanation, note, or extra text.\n"
-            f"Asset details:\n{asset}\n"
-            f"Raw Trusted Data:\n{tech}\n"
-            f"Comparable listings found online:\n{comparable}\n"
-        )
-        if ai_data:
-            prompt += f"AI Data:\n{ai_data}\n"
+            # Default prompt - matches frontend PromptEditor.js
+            ai_data_section = f"\nAI Data: {ai_data}" if ai_data else ""
+            prompt = f"""You are an expert in construction equipment valuation. Read the asset details, technical specs, and comparable listings below. Choose the single most relevant price, convert it to USD if needed, and return ONLY the final USD amount formatted like 'XXXXXX.XX'. If no relevant price exists, return blank. Do not add any explanation, note, or extra text.
+
+Reference information (these values will be automatically filled from the sheet columns):
+Asset Name: {asset}
+Raw Trusted Data: {tech_specs}
+AI Comparable Price: {comparable}{ai_data_section}"""
         
         try:
-            # Use Perplexity model if available, otherwise OpenAI
-            if use_perplexity:
-                # Perplexity models: Try "sonar" first (as used in original script), fallback to sonar-large-online
-                model = "sonar"  # Perplexity model with web search (as used in original script)
-            else:
-                model = "gpt-4o-mini"  # OpenAI model
+            model = "sonar"
+            async_client = AsyncOpenAI(
+                api_key=api_key_clean,
+                base_url="https://api.perplexity.ai"
+            )
             
-            response = client.chat.completions.create(
+            response = await async_client.chat.completions.create(
                 model=model,
                 messages=[
-                    {
-                        "role": "system",
-                        "content": "You are a precise pricing analyst. Always return only numeric values in USD format."
-                    },
-                    {
-                        "role": "user",
-                        "content": prompt
-                    }
+                    {"role": "system", "content": "You are a precise pricing analyst. Always return only numeric values in USD format."},
+                    {"role": "user", "content": prompt}
                 ],
                 max_tokens=50,
-                temperature=0.1  # Low temperature for consistent, focused responses
+                temperature=0.1
             )
             
             price_text = response.choices[0].message.content.strip()
             
-            # Handle "NONE" or empty responses
             if not price_text or price_text.upper() in ['NONE', 'N/A', 'NA', '']:
-                continue
+                return (i, row_num, None, None)
             
-            # Normalize and validate the extracted price
             normalized_price = normalize_price(price_text)
             
             if normalized_price is not None and normalized_price > 0:
-                # Format price to 2 decimal places (matching original format XXXXXX.XX)
                 formatted_price = f"{normalized_price:.2f}"
-                
-                # Ensure row is long enough
                 while len(row) <= price_idx:
                     row.append("")
-                
-                # Store the price in the row data
                 row[price_idx] = formatted_price
-                filled_rows.append(row_num)  # Track which rows we successfully filled
-                print(f"✅ Row {row_num}: Successfully extracted price ${formatted_price}")  # Debug log
+                return (i, row_num, formatted_price, None)
             else:
-                # Only log if we got a response but couldn't parse it
-                if price_text:
-                    errors.append(f'Row {row_num}: Could not extract valid price from response: "{price_text}"')
-                    print(f"⚠️ Row {row_num}: Invalid price format: '{price_text}'")  # Debug log
-                    
-        except Exception as api_error:
-            # Check if it's a critical error that should stop processing
-            error_str = str(api_error)
-            error_code = getattr(api_error, 'status_code', None) or getattr(api_error.response, 'status_code', None) if hasattr(api_error, 'response') else None
-            error_detail = getattr(api_error, 'body', None) or (getattr(api_error.response, 'json', lambda: {})() if hasattr(api_error, 'response') and hasattr(api_error.response, 'json') else {})
-            api_name = "Perplexity" if use_perplexity else "OpenAI"
+                return (i, row_num, None, (None, f'Could not extract valid price from: "{price_text}"'))
+        except Exception as e:
+            error_code = getattr(e, 'status_code', None)
+            error_detail = str(e)
+            return (i, row_num, None, (error_code, error_detail))
+    
+    # Process in batches of 20
+    BATCH_SIZE = 20
+    total_batches = (total_to_process + BATCH_SIZE - 1) // BATCH_SIZE
+    
+    progress_counter = {"success": 0, "errors": 0}
+    progress_lock = asyncio.Lock()
+    
+    async def process_single_row_with_progress(row_data):
+        """Process a single row and send individual progress update."""
+        result = await process_single_row(row_data)
+        
+        async with progress_lock:
+            if result and result[2] is not None:  # Success
+                progress_counter["success"] += 1
+            elif result and result[3] is not None:  # Error
+                progress_counter["errors"] += 1
             
-            # Check for critical errors (authentication, invalid model, quota exceeded)
-            is_critical = False
-            critical_msg = ""
+            if session_id:
+                try:
+                    from websocket_manager import manager
+                    await manager.broadcast_to_session(session_id, {
+                        "type": "progress",
+                        "step": "Extract price from AI Comparable",
+                        "total": len(rows),
+                        "processed": progress_counter["success"] + progress_counter["errors"],
+                        "success": progress_counter["success"],
+                        "errors": progress_counter["errors"],
+                        "skipped": skipped_empty_price,
+                    })
+                except Exception as e:
+                    print(f"DEBUG: Failed to send progress update: {e}")
+        
+        return result
+    
+    async def process_batch(batch, batch_num, total_batches):
+        """Process a batch of rows in parallel."""
+        print(f"DEBUG: Processing batch {batch_num}/{total_batches} ({len(batch)} rows)...")
+        tasks = [process_single_row_with_progress(row_data) for row_data in batch]
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        return results
+    
+    async def process_all_batches():
+        """Process all rows in batches."""
+        all_results = []
+        from websocket_manager import manager
+        
+        for batch_num in range(total_batches):
+            if session_id and manager.is_cancelled(session_id):
+                print(f"DEBUG: Process cancelled by user, stopping at batch {batch_num + 1}/{total_batches}", flush=True)
+                break
             
-            if error_code == 401 or 'invalid_api_key' in error_str.lower() or 'incorrect api key' in error_str.lower():
-                is_critical = True
-                critical_msg = f'{api_name} API key authentication failed.'
-            elif error_code == 400 and ('invalid model' in error_str.lower() or 'invalid_model' in str(error_detail).lower()):
-                is_critical = True
-                critical_msg = f'{api_name} API model "{model}" is invalid. Please check the model name.'
-            elif error_code == 429 or 'quota' in error_str.lower() or 'insufficient_quota' in str(error_detail).lower():
-                is_critical = True
-                critical_msg = f'{api_name} API quota exceeded. Please add credits to your account.'
+            start_idx = batch_num * BATCH_SIZE
+            end_idx = min(start_idx + BATCH_SIZE, total_to_process)
+            batch = rows_to_process[start_idx:end_idx]
             
-            if is_critical:
-                errors.append(critical_msg)
-                print(f"\n[CRITICAL ERROR] {critical_msg}")
-                print(f"   Error code: {error_code}")
-                print(f"   Error details: {error_str}")
-                if 'invalid model' in error_str.lower():
-                    print(f"   Model used: {model}")
-                    if use_perplexity:
-                        print("   Check Perplexity docs: https://docs.perplexity.ai/getting-started/models")
-                print("   Stopping processing to avoid wasting API calls.\n")
+            batch_results = await process_batch(batch, batch_num + 1, total_batches)
+            all_results.extend(batch_results)
+            
+            processed_in_batch = sum(1 for r in batch_results if r and r[2] is not None)
+            print(f"DEBUG: Batch {batch_num + 1}/{total_batches} completed: {processed_in_batch}/{len(batch)} rows processed")
+        
+        return all_results
+    
+    # Run async processing
+    try:
+        results = await process_all_batches()
+    except Exception as e:
+        error_msg = f'Failed to process batches: {str(e)}'
+        print(f"ERROR: {error_msg}")
+        return rows, [error_msg], []
+    
+    # Process results
+    for result in results:
+        if isinstance(result, Exception):
+            errors.append(f'Batch processing error: {str(result)}')
+            continue
+        
+        if result is None:
+            continue
+        
+        i, row_num, price_value, error_info = result
+        
+        if error_info:
+            error_code, error_detail = error_info
+            # Critical errors
+            if error_code in [400, 401, 429]:
+                api_name = "Perplexity"
+                if error_code == 401:
+                    error_msg = f'{api_name} API key authentication failed.'
+                elif error_code == 400:
+                    error_msg = f'{api_name} API model is invalid.'
+                elif error_code == 429:
+                    error_msg = f'{api_name} API quota exceeded.'
+                else:
+                    error_msg = f'{api_name} API error (code {error_code}).'
+                
+                errors.append(error_msg)
+                print(f"❌ {error_msg}")
                 return rows, errors, filled_rows
             
-            # For non-critical errors, log and continue
-            error_msg = f'{api_name} API error: Error code: {error_code} - {error_detail}'
-            errors.append(f'Row {row_num}: {error_msg}')
-            print(f"[WARNING] Row {row_num}: {error_msg}")
-            continue
+            # Non-critical errors
+            errors.append(f'Row {row_num}: {error_detail}')
+        elif price_value:
+            filled_rows.append(row_num)
+            print(f"✅ Row {row_num}: Successfully extracted price ${price_value}")
     
     # Summary logging
     print(f"\n📊 Processing Summary:")
     print(f"   - Total rows processed: {len(rows)}")
-    print(f"   - Rows with empty Price (candidates): {processed_count}")
+    print(f"   - Rows with empty Price (candidates): {total_to_process}")
     print(f"   - Rows skipped (already have price): {skipped_empty_price}")
     print(f"   - Rows skipped (missing data): {skipped_missing_data}")
     print(f"   - Rows successfully filled with price: {len(filled_rows)}")
@@ -1054,7 +1559,7 @@ def extract_final_price(rows, col_indices, custom_prompt=None):
     return rows, errors, filled_rows
 
 
-def ai_source_new_price(rows, col_indices, custom_prompt=None):
+async def ai_source_new_price(rows, col_indices, custom_prompt=None, session_id=None):
     """
     Step 4: AI Source New Price
     
@@ -1078,73 +1583,38 @@ def ai_source_new_price(rows, col_indices, custom_prompt=None):
     """
     print("DEBUG: ai_source_new_price function called")
     from openai import OpenAI
-    from config import OPENAI_API_KEY, PERPLEXITY_API_KEY
+    from config import PERPLEXITY_API_KEY
     import re
     
-    # Try Perplexity first (required for web search), fall back to OpenAI if Perplexity not available
-    use_perplexity = False
-    api_key_clean = None
+    # Perplexity is required for all steps
+    if not PERPLEXITY_API_KEY:
+        error_msg = 'Perplexity API key required. Please set PERPLEXITY_API_KEY in your .env file.'
+        print(f"ERROR: {error_msg}")
+        return rows, [error_msg], []
     
-    if PERPLEXITY_API_KEY:
-        api_key_clean = PERPLEXITY_API_KEY.strip()
-        # Remove quotes if present
-        if api_key_clean.startswith('"') and api_key_clean.endswith('"'):
-            api_key_clean = api_key_clean[1:-1].strip()
-        if api_key_clean.startswith("'") and api_key_clean.endswith("'"):
-            api_key_clean = api_key_clean[1:-1].strip()
-        
-        # Perplexity API keys start with "pplx-"
-        if api_key_clean and len(api_key_clean) > 10:
-            if api_key_clean.startswith('pplx-'):
-                use_perplexity = True
-                key_preview = f"{api_key_clean[:10]}...{api_key_clean[-4:]}" if len(api_key_clean) > 14 else "***"
-                print(f"DEBUG: ✅ Using Perplexity API for new price search (key preview: {key_preview}, length: {len(api_key_clean)})")
-            else:
-                print(f"DEBUG: Perplexity API key found but doesn't start with 'pplx-', trying OpenAI...")
-        else:
-            print(f"DEBUG: Perplexity API key found but appears invalid (too short), trying OpenAI...")
+    api_key_clean = PERPLEXITY_API_KEY.strip()
+    # Remove quotes if present
+    if api_key_clean.startswith('"') and api_key_clean.endswith('"'):
+        api_key_clean = api_key_clean[1:-1].strip()
+    if api_key_clean.startswith("'") and api_key_clean.endswith("'"):
+        api_key_clean = api_key_clean[1:-1].strip()
     
-    # Fall back to OpenAI if Perplexity not available
-    if not use_perplexity:
-        if not OPENAI_API_KEY:
-            error_msg = 'Perplexity API key required for web search. Please set PERPLEXITY_API_KEY in your .env file.'
-            print(f"ERROR: {error_msg}")
-            return rows, [error_msg], []
-        
-        api_key_clean = OPENAI_API_KEY.strip()
-        # Remove quotes and special characters
-        if api_key_clean.startswith('"') and api_key_clean.endswith('"'):
-            api_key_clean = api_key_clean[1:-1].strip()
-        if api_key_clean.startswith("'") and api_key_clean.endswith("'"):
-            api_key_clean = api_key_clean[1:-1].strip()
-        if api_key_clean.startswith('<') and api_key_clean.endswith('>'):
-            api_key_clean = api_key_clean[1:-1].strip()
-        
-        # Extract key if embedded in text
-        if not api_key_clean.startswith('sk-'):
-            match = re.search(r'sk-proj-[a-zA-Z0-9\-]{50,}', api_key_clean) or re.search(r'sk-[a-zA-Z0-9]{20,}', api_key_clean)
-            if match:
-                api_key_clean = match.group(0)
-        
-        if not api_key_clean.startswith('sk-'):
-            error_msg = f'OpenAI API key format appears invalid. Keys should start with "sk-" or "sk-proj-".'
-            print(f"ERROR: {error_msg}")
-            return rows, [error_msg], []
-        
-        print(f"DEBUG: Using OpenAI API (key length: {len(api_key_clean)})")
+    # Perplexity API keys start with "pplx-"
+    if not api_key_clean or len(api_key_clean) <= 10 or not api_key_clean.startswith('pplx-'):
+        error_msg = 'Invalid Perplexity API key. Keys must start with "pplx-" and be at least 10 characters long.'
+        print(f"ERROR: {error_msg}")
+        return rows, [error_msg], []
+    
+    key_preview = f"{api_key_clean[:10]}...{api_key_clean[-4:]}" if len(api_key_clean) > 14 else "***"
+    print(f"DEBUG: ✅ Using Perplexity API for new price search (key preview: {key_preview}, length: {len(api_key_clean)})")
     
     try:
-        if use_perplexity:
-            print(f"DEBUG: Initializing Perplexity client...")
-            client = OpenAI(
-                api_key=api_key_clean,
-                base_url="https://api.perplexity.ai"
-            )
-            print(f"DEBUG: Perplexity client initialized successfully")
-        else:
-            print(f"DEBUG: Initializing OpenAI client...")
-            client = OpenAI(api_key=api_key_clean)
-            print(f"DEBUG: OpenAI client initialized successfully")
+        print(f"DEBUG: Initializing Perplexity client...")
+        client = OpenAI(
+            api_key=api_key_clean,
+            base_url="https://api.perplexity.ai"
+        )
+        print(f"DEBUG: Perplexity client initialized successfully")
     except Exception as e:
         error_msg = f'Failed to initialize API client: {str(e)}'
         print(f"ERROR: {error_msg}")
@@ -1222,48 +1692,51 @@ def ai_source_new_price(rows, col_indices, custom_prompt=None):
             return ''
         return str(value).strip()
     
-    processed_count = 0
     skipped_empty_price = 0
     skipped_missing_data = 0
     
-    print(f"DEBUG: Starting to process {len(rows)} rows for new price search...")
-    print(f"DEBUG: Price column index: {price_idx}")
-    
-    # Count empty rows first for debugging
-    empty_count = 0
-    for row in rows:
-        if is_price_cell_empty(row, price_idx):
-            empty_count += 1
-    print(f"DEBUG: Found {empty_count} rows with empty Price column")
-    
-    # Use Perplexity model for web search
-    model_name = "sonar" if use_perplexity else "gpt-4o-mini"
-    print(f"DEBUG: Using model: {model_name}")
-    
+    # Collect rows that need processing
+    rows_to_process = []
     for i, row in enumerate(rows):
-        if i > 0 and i % 10 == 0:
-            print(f"DEBUG: Processed {i}/{len(rows)} rows so far...")
-        row_num = i + 3  # Row number in sheet (1-indexed, starting from row 3)
-        
-        # Only process rows where Price cell is EMPTY
+        row_num = i + 3
+        # Skip if already filled
         if not is_price_cell_empty(row, price_idx):
             skipped_empty_price += 1
             continue
         
-        processed_count += 1
-        
         # Extract required data
         asset = safe_get_cell(row, asset_idx)
         tech = safe_get_cell(row, tech_idx)
-        ai_data = safe_get_cell(row, ai_data_idx)  # Optional
+        ai_data = safe_get_cell(row, ai_data_idx)
         
         # Skip if required data is missing
         if not asset or not tech:
             skipped_missing_data += 1
-            print(f"DEBUG: Row {row_num}: Skipped - missing data (asset: {bool(asset)}, tech: {bool(tech)})")
             continue
         
-        # Build prompt - use custom if provided, otherwise use default
+        rows_to_process.append((i, row, row_num, asset, tech, ai_data))
+    
+    total_to_process = len(rows_to_process)
+    print(f"DEBUG: Starting to process {total_to_process} rows (out of {len(rows)} total) for new price search...")
+    print(f"DEBUG: Skipped {skipped_empty_price} rows (already filled), {skipped_missing_data} rows (missing data)")
+    
+    # Process in parallel batches of 20
+    import asyncio
+    from openai import AsyncOpenAI
+    
+    model_name = "sonar"
+    print(f"DEBUG: Using model: {model_name}")
+    
+    async def process_single_row(row_data):
+        """Process a single row asynchronously."""
+        if session_id:
+            from websocket_manager import manager
+            if manager.is_cancelled(session_id):
+                return None
+        
+        i, row, row_num, asset, tech, ai_data = row_data
+        
+        # Build prompt
         if custom_prompt:
             prompt = custom_prompt.replace('{asset}', asset).replace('{tech_specs}', tech)
             if ai_data:
@@ -1272,17 +1745,21 @@ def ai_source_new_price(rows, col_indices, custom_prompt=None):
                 prompt = prompt.replace('{ai_data}', '')
             prompt = prompt.replace('{comparable}', '')
         else:
+            # Default prompt - matches frontend PromptEditor.js
+            ai_data_section = f"\nAI Data: {ai_data}" if ai_data else ""
             prompt = f"""You are an expert in construction equipment valuation. Based ONLY on the asset details below, return the current market price of a BRAND NEW unit in USD. Return ONLY the price formatted exactly like this: 'XXXXXX.XX'. If no explicit new price is available, return blank. Do not add any words, explanations, notes, or symbols. Do not say 'blank', 'N/A', or anything else. Only output the price or nothing.
-Asset details:
-{asset}
-Raw Trusted Data:
-{tech}"""
-            if ai_data:
-                prompt += f"\nAdditional AI data: {ai_data}"
+
+Reference information (these values will be automatically filled from the sheet columns):
+Asset Name: {asset}
+Raw Trusted Data: {tech}{ai_data_section}"""
         
         try:
-            print(f"DEBUG: Row {row_num}: Calling API for new price search...")
-            response = client.chat.completions.create(
+            async_client = AsyncOpenAI(
+                api_key=api_key_clean,
+                base_url="https://api.perplexity.ai"
+            )
+            
+            response = await async_client.chat.completions.create(
                 model=model_name,
                 messages=[
                     {"role": "system", "content": "You are an expert in construction equipment valuation. Return only numeric prices in USD format (XXXXXX.XX), or nothing if unavailable."},
@@ -1293,38 +1770,106 @@ Raw Trusted Data:
             )
             
             price_text = response.choices[0].message.content.strip()
-            print(f"DEBUG: Row {row_num}: API response: '{price_text}'")
-            
-            # Extract price
             price_value = normalize_price(price_text)
-            print(f"DEBUG: Row {row_num}: Normalized price value: {price_value}")
             
             if price_value and price_value > 0:
-                # Format as XXXXXX.XX
                 formatted_price = f"{price_value:.2f}"
-                
-                # Ensure row has enough columns
                 while len(row) <= price_idx:
                     row.append("")
-                
-                # Store the price in the row data
                 row[price_idx] = formatted_price
-                filled_rows.append(row_num)
-                print(f"✅ Row {row_num}: Successfully found new price ${formatted_price}")
+                return (i, row_num, formatted_price, None)
             else:
-                print(f"⚠️ Row {row_num}: No valid new price found (response: '{price_text}', normalized: {price_value})")
-        
+                return (i, row_num, None, None)
         except Exception as e:
+            error_code = getattr(e, 'status_code', None)
             error_detail = str(e)
-            error_code = None
+            return (i, row_num, None, (error_code, error_detail))
+    
+    # Process in batches of 20
+    BATCH_SIZE = 20
+    total_batches = (total_to_process + BATCH_SIZE - 1) // BATCH_SIZE
+    
+    progress_counter = {"success": 0, "errors": 0}
+    progress_lock = asyncio.Lock()
+    
+    async def process_single_row_with_progress(row_data):
+        """Process a single row and send individual progress update."""
+        result = await process_single_row(row_data)
+        
+        async with progress_lock:
+            if result and result[2] is not None:  # Success
+                progress_counter["success"] += 1
+            elif result and result[3] is not None:  # Error
+                progress_counter["errors"] += 1
             
-            # Check for API errors
-            if hasattr(e, 'status_code'):
-                error_code = e.status_code
-            elif hasattr(e, 'response') and hasattr(e.response, 'status_code'):
-                error_code = e.response.status_code
+            if session_id:
+                try:
+                    from websocket_manager import manager
+                    await manager.broadcast_to_session(session_id, {
+                        "type": "progress",
+                        "step": "AI Source New Price",
+                        "total": len(rows),
+                        "processed": progress_counter["success"] + progress_counter["errors"],
+                        "success": progress_counter["success"],
+                        "errors": progress_counter["errors"],
+                        "skipped": skipped_empty_price,
+                    })
+                except Exception as e:
+                    print(f"DEBUG: Failed to send progress update: {e}")
+        
+        return result
+    
+    async def process_batch(batch, batch_num, total_batches):
+        """Process a batch of rows in parallel."""
+        print(f"DEBUG: Processing batch {batch_num}/{total_batches} ({len(batch)} rows)...")
+        tasks = [process_single_row_with_progress(row_data) for row_data in batch]
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        return results
+    
+    async def process_all_batches():
+        """Process all rows in batches."""
+        all_results = []
+        from websocket_manager import manager
+        
+        for batch_num in range(total_batches):
+            if session_id and manager.is_cancelled(session_id):
+                print(f"DEBUG: Process cancelled by user, stopping at batch {batch_num + 1}/{total_batches}", flush=True)
+                break
             
-            # Critical errors: stop processing immediately
+            start_idx = batch_num * BATCH_SIZE
+            end_idx = min(start_idx + BATCH_SIZE, total_to_process)
+            batch = rows_to_process[start_idx:end_idx]
+            
+            batch_results = await process_batch(batch, batch_num + 1, total_batches)
+            all_results.extend(batch_results)
+            
+            processed_in_batch = sum(1 for r in batch_results if r and r[2] is not None)
+            print(f"DEBUG: Batch {batch_num + 1}/{total_batches} completed: {processed_in_batch}/{len(batch)} rows processed")
+        
+        return all_results
+    
+    # Run async processing
+    try:
+        results = await process_all_batches()
+    except Exception as e:
+        error_msg = f'Failed to process batches: {str(e)}'
+        print(f"ERROR: {error_msg}")
+        return rows, [error_msg], []
+    
+    # Process results
+    for result in results:
+        if isinstance(result, Exception):
+            errors.append(f'Batch processing error: {str(result)}')
+            continue
+        
+        if result is None:
+            continue
+        
+        i, row_num, price_value, error_info = result
+        
+        if error_info:
+            error_code, error_detail = error_info
+            # Critical errors
             if error_code in [400, 401, 429]:
                 if error_code == 401:
                     error_msg = f"CRITICAL: API authentication failed. Please check your API key. Error: {error_detail}"
@@ -1335,19 +1880,19 @@ Raw Trusted Data:
                 else:
                     error_msg = f"CRITICAL: API error (code {error_code}). Error: {error_detail}"
                 
-                print(f"❌ {error_msg}")
                 errors.append(error_msg)
-                # Stop processing on critical errors
+                print(f"❌ {error_msg}")
                 return rows, errors, filled_rows
             
-            # Non-critical errors: log and continue
-            error_msg = f'Row {row_num}: API error: {error_detail}'
-            errors.append(error_msg)
-            print(f"❌ {error_msg}")
+            # Non-critical errors
+            errors.append(f'Row {row_num}: API error: {error_detail}')
+        elif price_value:
+            filled_rows.append(row_num)
+            print(f"✅ Row {row_num}: Successfully found new price ${price_value}")
     
     print(f"\n📊 Processing Summary:")
     print(f"  - Total rows processed: {len(rows)}")
-    print(f"  - Rows with empty Price (candidates): {processed_count + skipped_empty_price}")
+    print(f"  - Rows with empty Price (candidates): {total_to_process + skipped_empty_price}")
     print(f"  - Rows skipped (already have price): {skipped_empty_price}")
     print(f"  - Rows skipped (missing data): {skipped_missing_data}")
     print(f"  - Rows successfully filled with price: {len(filled_rows)}")
@@ -1356,7 +1901,7 @@ Raw Trusted Data:
     return rows, errors, filled_rows
 
 
-def ai_similar_comparable(rows, col_indices, custom_prompt=None):
+async def ai_similar_comparable(rows, col_indices, custom_prompt=None, session_id=None):
     """
     Step 5: AI Similar Comparable
     Finds similar asset prices online based on technical specifications and AI Data.
@@ -1365,49 +1910,34 @@ def ai_similar_comparable(rows, col_indices, custom_prompt=None):
     """
     print("DEBUG: ai_similar_comparable function called")
     from openai import OpenAI
-    from config import OPENAI_API_KEY, PERPLEXITY_API_KEY
+    from config import PERPLEXITY_API_KEY
     import re
     
-    # Perplexity is preferred for web search
-    use_perplexity = False
-    api_key_clean = None
+    # Perplexity is required for all steps
+    if not PERPLEXITY_API_KEY:
+        error_msg = 'Perplexity API key required. Please set PERPLEXITY_API_KEY in your .env file.'
+        print(f"ERROR: {error_msg}")
+        return rows, [error_msg], []
     
-    if PERPLEXITY_API_KEY:
-        api_key_clean = PERPLEXITY_API_KEY.strip()
-        if api_key_clean.startswith('"') and api_key_clean.endswith('"'):
-            api_key_clean = api_key_clean[1:-1].strip()
-        if api_key_clean.startswith("'") and api_key_clean.endswith("'"):
-            api_key_clean = api_key_clean[1:-1].strip()
-        
-        if api_key_clean and len(api_key_clean) > 10:
-            if api_key_clean.startswith('pplx-'):
-                use_perplexity = True
-                print(f"DEBUG: Using Perplexity API for similar comparables search")
+    api_key_clean = PERPLEXITY_API_KEY.strip()
+    # Remove quotes if present
+    if api_key_clean.startswith('"') and api_key_clean.endswith('"'):
+        api_key_clean = api_key_clean[1:-1].strip()
+    if api_key_clean.startswith("'") and api_key_clean.endswith("'"):
+        api_key_clean = api_key_clean[1:-1].strip()
     
-    if not use_perplexity:
-        if not OPENAI_API_KEY:
-            error_msg = 'Perplexity API key required for web search. Please set PERPLEXITY_API_KEY in your .env file.'
-            print(f"ERROR: {error_msg}")
-            return rows, [error_msg], []
-        
-        api_key_clean = OPENAI_API_KEY.strip()
-        if api_key_clean.startswith('"') and api_key_clean.endswith('"'):
-            api_key_clean = api_key_clean[1:-1].strip()
-        if api_key_clean.startswith("'") and api_key_clean.endswith("'"):
-            api_key_clean = api_key_clean[1:-1].strip()
-        
-        if not api_key_clean.startswith('sk-'):
-            match = re.search(r'sk-proj-[a-zA-Z0-9\-]{50,}', api_key_clean) or re.search(r'sk-[a-zA-Z0-9]{20,}', api_key_clean)
-            if match:
-                api_key_clean = match.group(0)
-        
-        print(f"DEBUG: Using OpenAI API (web search may be limited)")
+    # Perplexity API keys start with "pplx-"
+    if not api_key_clean or len(api_key_clean) <= 10 or not api_key_clean.startswith('pplx-'):
+        error_msg = 'Invalid Perplexity API key. Keys must start with "pplx-" and be at least 10 characters long.'
+        print(f"ERROR: {error_msg}")
+        return rows, [error_msg], []
+    
+    key_preview = f"{api_key_clean[:10]}...{api_key_clean[-4:]}" if len(api_key_clean) > 14 else "***"
+    print(f"DEBUG: ✅ Using Perplexity API for similar comparables search (key preview: {key_preview}, length: {len(api_key_clean)})")
     
     try:
-        if use_perplexity:
-            client = OpenAI(api_key=api_key_clean, base_url="https://api.perplexity.ai")
-        else:
-            client = OpenAI(api_key=api_key_clean)
+        client = OpenAI(api_key=api_key_clean, base_url="https://api.perplexity.ai")
+        print(f"DEBUG: Perplexity client initialized successfully")
     except Exception as e:
         error_msg = f'Failed to initialize API client: {str(e)}'
         print(f"ERROR: {error_msg}")
@@ -1458,24 +1988,17 @@ def ai_similar_comparable(rows, col_indices, custom_prompt=None):
             return ''
         return str(value).strip()
     
-    processed_count = 0
     skipped_empty_price = 0
     skipped_missing_data = 0
     
-    model_name = "sonar" if use_perplexity else "gpt-4o-mini"
-    print(f"DEBUG: Using model: {model_name}")
-    
+    # Collect rows that need processing
+    rows_to_process = []
     for i, row in enumerate(rows):
-        if i > 0 and i % 10 == 0:
-            print(f"DEBUG: Processed {i}/{len(rows)} rows so far...")
         row_num = i + 3
-        
-        # Only process rows where Price cell is EMPTY
+        # Skip if already filled
         if not is_price_cell_empty(row, price_idx):
             skipped_empty_price += 1
             continue
-        
-        processed_count += 1
         
         # Extract required data
         asset = safe_get_cell(row, asset_idx)
@@ -1485,10 +2008,31 @@ def ai_similar_comparable(rows, col_indices, custom_prompt=None):
         # Skip if required data is missing
         if not asset or not tech:
             skipped_missing_data += 1
-            print(f"DEBUG: Row {row_num}: Skipped - missing data")
             continue
         
-        # Build prompt - use custom if provided, otherwise use default
+        rows_to_process.append((i, row, row_num, asset, tech, ai_data))
+    
+    total_to_process = len(rows_to_process)
+    print(f"DEBUG: Starting to process {total_to_process} rows (out of {len(rows)} total) for similar comparables search...")
+    print(f"DEBUG: Skipped {skipped_empty_price} rows (already filled), {skipped_missing_data} rows (missing data)")
+    
+    # Process in parallel batches of 20
+    import asyncio
+    from openai import AsyncOpenAI
+    
+    model_name = "sonar"
+    print(f"DEBUG: Using model: {model_name}")
+    
+    async def process_single_row(row_data):
+        """Process a single row asynchronously."""
+        if session_id:
+            from websocket_manager import manager
+            if manager.is_cancelled(session_id):
+                return None
+        
+        i, row, row_num, asset, tech, ai_data = row_data
+        
+        # Build prompt
         if custom_prompt:
             prompt = custom_prompt.replace('{asset}', asset).replace('{tech_specs}', tech)
             if ai_data:
@@ -1497,16 +2041,21 @@ def ai_similar_comparable(rows, col_indices, custom_prompt=None):
                 prompt = prompt.replace('{ai_data}', '')
             prompt = prompt.replace('{comparable}', '')
         else:
+            # Default prompt - matches frontend PromptEditor.js
+            ai_data_section = f"\nAI Data: {ai_data}" if ai_data else ""
             prompt = f"""You are an expert in construction equipment valuation. Search for similar equipment based on the Raw Trusted Data and AI Data provided below. Find comparable assets that match the specifications and characteristics. For each similar asset found, return ONLY: Condition, Price, and the Listing URL. Format each on one line as: Condition: [condition], Price: [price], URL: [link]. Return up to 10 recent results. If no similar assets are found, return blank.
 
-Asset: {asset}
-Raw Trusted Data: {tech}"""
-            if ai_data:
-                prompt += f"\nAI Data: {ai_data}"
+Reference information (these values will be automatically filled from the sheet columns):
+Asset Name: {asset}
+Raw Trusted Data: {tech}{ai_data_section}"""
         
         try:
-            print(f"DEBUG: Row {row_num}: Calling API for similar comparables search...")
-            response = client.chat.completions.create(
+            async_client = AsyncOpenAI(
+                api_key=api_key_clean,
+                base_url="https://api.perplexity.ai"
+            )
+            
+            response = await async_client.chat.completions.create(
                 model=model_name,
                 messages=[
                     {"role": "system", "content": "You are a web search assistant. Search for similar equipment listings and return only Condition, Price, and URL for each listing, formatted as specified."},
@@ -1517,12 +2066,10 @@ Raw Trusted Data: {tech}"""
             )
             
             similar_text = response.choices[0].message.content.strip()
-            print(f"DEBUG: Row {row_num}: API response length: {len(similar_text)} chars")
             
-            # Extract price from the similar comparables (similar to extract_final_price logic)
+            # Extract price from similar comparables
+            price_value = None
             if similar_text:
-                # Try to extract a price from the similar comparables
-                # Look for price patterns
                 price_patterns = [
                     r'\$[\d,]+\.?\d*',
                     r'USD\s*[\d,]+\.?\d*',
@@ -1530,42 +2077,114 @@ Raw Trusted Data: {tech}"""
                     r'Price:\s*\$?[\d,]+\.?\d*',
                 ]
                 
-                price_value = None
                 for pattern in price_patterns:
                     matches = re.findall(pattern, similar_text, re.IGNORECASE)
                     if matches:
-                        # Take the first price found
                         price_str = matches[0]
-                        # Clean the price string
                         price_str = re.sub(r'[^\d.]', '', price_str.replace(',', ''))
                         try:
                             price_value = float(price_str)
                             break
                         except ValueError:
                             continue
-                
-                if price_value:
-                    # Ensure row has enough columns
-                    while len(row) <= price_idx:
-                        row.append("")
-                    
-                    row[price_idx] = f"{price_value:.2f}"
-                    filled_rows.append(row_num)
-                    print(f"✅ Row {row_num}: Successfully found similar comparable price: ${price_value:.2f}")
-                else:
-                    print(f"⚠️ Row {row_num}: Similar comparables found but no valid price extracted")
+            
+            if price_value:
+                while len(row) <= price_idx:
+                    row.append("")
+                row[price_idx] = f"{price_value:.2f}"
+                return (i, row_num, f"{price_value:.2f}", None)
             else:
-                print(f"⚠️ Row {row_num}: No similar comparables found")
-        
+                return (i, row_num, None, None)
         except Exception as e:
+            error_code = getattr(e, 'status_code', None)
             error_detail = str(e)
-            error_code = None
+            return (i, row_num, None, (error_code, error_detail))
+    
+    # Process in batches of 20
+    BATCH_SIZE = 20
+    total_batches = (total_to_process + BATCH_SIZE - 1) // BATCH_SIZE
+    
+    progress_counter = {"success": 0, "errors": 0}
+    progress_lock = asyncio.Lock()
+    
+    async def process_single_row_with_progress(row_data):
+        """Process a single row and send individual progress update."""
+        result = await process_single_row(row_data)
+        
+        async with progress_lock:
+            if result and result[2] is not None:  # Success
+                progress_counter["success"] += 1
+            elif result and result[3] is not None:  # Error
+                progress_counter["errors"] += 1
             
-            if hasattr(e, 'status_code'):
-                error_code = e.status_code
-            elif hasattr(e, 'response') and hasattr(e.response, 'status_code'):
-                error_code = e.response.status_code
+            if session_id:
+                try:
+                    from websocket_manager import manager
+                    await manager.broadcast_to_session(session_id, {
+                        "type": "progress",
+                        "step": "AI Similar Comparable",
+                        "total": len(rows),
+                        "processed": progress_counter["success"] + progress_counter["errors"],
+                        "success": progress_counter["success"],
+                        "errors": progress_counter["errors"],
+                        "skipped": skipped_empty_price,
+                    })
+                except Exception as e:
+                    print(f"DEBUG: Failed to send progress update: {e}")
+        
+        return result
+    
+    async def process_batch(batch, batch_num, total_batches):
+        """Process a batch of rows in parallel."""
+        print(f"DEBUG: Processing batch {batch_num}/{total_batches} ({len(batch)} rows)...")
+        tasks = [process_single_row_with_progress(row_data) for row_data in batch]
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        return results
+    
+    async def process_all_batches():
+        """Process all rows in batches."""
+        all_results = []
+        from websocket_manager import manager
+        
+        for batch_num in range(total_batches):
+            if session_id and manager.is_cancelled(session_id):
+                print(f"DEBUG: Process cancelled by user, stopping at batch {batch_num + 1}/{total_batches}", flush=True)
+                break
             
+            start_idx = batch_num * BATCH_SIZE
+            end_idx = min(start_idx + BATCH_SIZE, total_to_process)
+            batch = rows_to_process[start_idx:end_idx]
+            
+            batch_results = await process_batch(batch, batch_num + 1, total_batches)
+            all_results.extend(batch_results)
+            
+            processed_in_batch = sum(1 for r in batch_results if r and r[2] is not None)
+            print(f"DEBUG: Batch {batch_num + 1}/{total_batches} completed: {processed_in_batch}/{len(batch)} rows processed")
+        
+        return all_results
+    
+    # Run async processing
+    try:
+        results = await process_all_batches()
+    except Exception as e:
+        error_msg = f'Failed to process batches: {str(e)}'
+        print(f"ERROR: {error_msg}")
+        return rows, [error_msg], []
+    
+    # Process results
+    for result in results:
+        if isinstance(result, Exception):
+            errors.append(f'Batch processing error: {str(result)}')
+            continue
+        
+        if result is None:
+            continue
+        
+        i, row_num, price_value, error_info = result
+        
+        if error_info:
+            error_code, error_detail = error_info
+            # Critical errors
             if error_code in [400, 401, 429]:
                 if error_code == 401:
                     error_msg = f"CRITICAL: API authentication failed. Please check your API key."
@@ -1576,17 +2195,19 @@ Raw Trusted Data: {tech}"""
                 else:
                     error_msg = f"CRITICAL: API error (code {error_code})."
                 
-                print(f"❌ {error_msg}")
                 errors.append(error_msg)
+                print(f"❌ {error_msg}")
                 return rows, errors, filled_rows
             
-            error_msg = f'Row {row_num}: API error: {error_detail}'
-            errors.append(error_msg)
-            print(f"❌ {error_msg}")
+            # Non-critical errors
+            errors.append(f'Row {row_num}: API error: {error_detail}')
+        elif price_value:
+            filled_rows.append(row_num)
+            print(f"✅ Row {row_num}: Successfully found similar comparable price: ${price_value}")
     
     print(f"\n📊 Processing Summary:")
     print(f"  - Total rows processed: {len(rows)}")
-    print(f"  - Rows with empty Price (candidates): {processed_count + skipped_empty_price}")
+    print(f"  - Rows with empty Price (candidates): {total_to_process + skipped_empty_price}")
     print(f"  - Rows skipped (already have price): {skipped_empty_price}")
     print(f"  - Rows skipped (missing data): {skipped_missing_data}")
     print(f"  - Rows successfully filled with price: {len(filled_rows)}")
