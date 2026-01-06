@@ -22,11 +22,12 @@ import { fetchSheetPreview, runProcessStep, saveHistory, cancelProcess } from '.
 import { useNotificationContext } from '../context/NotificationContext';
 
 const STEPS = [
-  { id: 1, name: 'Build Description', color: '#1a2746' },
-  { id: 2, name: 'AI Source Comparables', color: '#ff8200' },
-  { id: 3, name: 'Extract price from AI Comparable', color: '#2196f3' },
-  { id: 4, name: 'AI Source New Price', color: '#ff9800' },
-  { id: 5, name: 'AI Similar Comparable', color: '#e2c69b' },
+  { id: 1, name: 'Generate AI Data', color: '#9c27b0' },
+  { id: 2, name: 'Build Description', color: '#1a2746' },
+  { id: 3, name: 'AI Source Comparables', color: '#ff8200' },
+  { id: 4, name: 'Extract price from AI Comparable', color: '#2196f3' },
+  { id: 5, name: 'AI Source New Price', color: '#ff9800' },
+  { id: 6, name: 'AI Similar Comparable', color: '#e2c69b' },
 ];
 
 export default function Home() {
@@ -691,6 +692,19 @@ export default function Home() {
       } else {
         console.warn(`⚠️ Home: Could not find 'Script Technical Description' column for calculating initialEmptyRows`);
       }
+    } else if (stepName === "Generate AI Data" && sheetRows.length > 0) {
+      const aiDataHeaderIndex = sheetHeaders.findIndex(h => 
+        h && h.toLowerCase().includes('ai data')
+      );
+      if (aiDataHeaderIndex >= 0) {
+        initialEmptyRows = sheetRows.filter(row => {
+          const aiDataValue = row[aiDataHeaderIndex];
+          return !aiDataValue || !String(aiDataValue).trim();
+        }).length;
+        console.log(`📊 Home: Calculated initialEmptyRows: ${initialEmptyRows} for step "${stepName}"`);
+      } else {
+        console.warn(`⚠️ Home: Could not find 'AI Data' column for calculating initialEmptyRows`);
+      }
     } else {
       console.log(`📊 Home: Skipping initialEmptyRows calculation (stepName: "${stepName}", sheetRows.length: ${sheetRows.length})`);
     }
@@ -781,10 +795,13 @@ export default function Home() {
             ? ((updatedStats.success + updatedStats.skipped) / updatedStats.total) * 100 
             : 100;
           
-          // Check if process is complete: if success + skipped = total, it's done
-          // For AI Source Comparables, the process is complete when all empty rows are filled
+          // Check if process is complete: if success + skipped + errors >= total, it's done
+          // For Generate AI Data and other steps, the process is complete when all rows are processed
+          // Also check if processed count equals total (for steps that use "processed" field)
+          const totalProcessed = updatedStats.success + updatedStats.skipped + updatedStats.errors;
           const isComplete = updatedStats.total > 0 && 
-            (updatedStats.success + updatedStats.skipped + updatedStats.errors) >= updatedStats.total;
+            (totalProcessed >= updatedStats.total || 
+             (updatedStats.processed && updatedStats.processed >= updatedStats.total));
           
           console.log(`📊 Home: Updating progress from HTTP response:`, {
             processId,
@@ -795,6 +812,33 @@ export default function Home() {
             calculation: `${updatedStats.success} + ${updatedStats.skipped} + ${updatedStats.errors} >= ${updatedStats.total} = ${(updatedStats.success + updatedStats.skipped + updatedStats.errors) >= updatedStats.total}`,
             processIsCompleted: process.isCompleted
           });
+          
+          // If process is complete based on HTTP response, mark it as completed immediately
+          // This ensures the UI updates even if WebSocket message doesn't arrive
+          if (isComplete && !process.isCompleted) {
+            console.log(`✅ Home: Process ${processId} is complete based on HTTP response, marking as completed immediately`);
+            const completionTime = Date.now();
+            const processStartTime = process.startTime || completionTime;
+            const finalElapsedTime = Math.floor((completionTime - processStartTime) / 1000);
+            
+            // Stop timer
+            if (processTimersRef.current[processId]) {
+              clearInterval(processTimersRef.current[processId]);
+              delete processTimersRef.current[processId];
+            }
+            
+            return {
+              ...prev,
+              [processId]: {
+                ...process,
+                isActive: false,
+                isCompleted: true,
+                elapsedTime: finalElapsedTime,
+                stats: updatedStats,
+                progress: 100, // Force to 100% when complete
+              },
+            };
+          }
           
           // If complete, mark as completed immediately
           if (isComplete && !process.isCompleted) {
@@ -1189,7 +1233,7 @@ export default function Home() {
                             )}
                           </Box>
                           <Box sx={{ display: 'flex', gap: 1 }}>
-                            {process.isActive && (
+                            {!process.isCompleted && (
                               <Button 
                                 size="small"
                                 variant="outlined"

@@ -32,10 +32,32 @@ export default function Monitor() {
       try {
         const parsed = JSON.parse(savedProcesses);
         console.log('📥 Monitor: Loaded processes from localStorage:', Object.keys(parsed).length);
-        setProcesses(parsed);
+        
+        // Clean up invalid processes (those that are neither active nor completed)
+        const cleaned = {};
+        Object.entries(parsed).forEach(([processId, process]) => {
+          // Only keep processes that are either active or completed
+          if (process.isActive || process.isCompleted) {
+            cleaned[processId] = process;
+          } else {
+            console.log(`🧹 Monitor: Removing invalid process ${processId} (neither active nor completed)`);
+          }
+        });
+        
+        if (Object.keys(cleaned).length !== Object.keys(parsed).length) {
+          console.log(`🧹 Monitor: Cleaned ${Object.keys(parsed).length - Object.keys(cleaned).length} invalid processes`);
+          // Update localStorage with cleaned processes
+          if (Object.keys(cleaned).length > 0) {
+            localStorage.setItem('monitorProcesses', JSON.stringify(cleaned));
+          } else {
+            localStorage.removeItem('monitorProcesses');
+          }
+        }
+        
+        setProcesses(cleaned);
         
         // Restart timers for active processes
-        Object.entries(parsed).forEach(([processId, process]) => {
+        Object.entries(cleaned).forEach(([processId, process]) => {
           if (process.isActive && !process.isCompleted && process.startTime) {
             startTimer(processId, process.startTime);
           }
@@ -134,6 +156,10 @@ export default function Monitor() {
             // For AI Source Comparables, initialEmptyRows = success (the rows that were filled)
             finalInitialEmptyRows = stats.success || 0;
             console.log(`📊 Monitor: Calculated initialEmptyRows for AI Source Comparables: ${finalInitialEmptyRows} (success: ${stats.success})`);
+          } else if (stepName === "Generate AI Data" && stats.skipped > 0) {
+            // For Generate AI Data, initialEmptyRows = total - skipped (rows that were already filled)
+            finalInitialEmptyRows = stats.total - stats.skipped;
+            console.log(`📊 Monitor: Calculated initialEmptyRows for Generate AI Data: ${finalInitialEmptyRows} (total: ${stats.total}, skipped: ${stats.skipped})`);
           }
         }
         
@@ -295,6 +321,9 @@ export default function Monitor() {
                   } else if (stepName === "AI Source Comparables") {
                     finalInitialEmptyRows = stats.success || 0;
                     console.log(`📊 Monitor: Calculated initialEmptyRows for AI Source Comparables: ${finalInitialEmptyRows}`);
+                  } else if (stepName === "Generate AI Data" && stats.skipped > 0) {
+                    finalInitialEmptyRows = stats.total - stats.skipped;
+                    console.log(`📊 Monitor: Calculated initialEmptyRows for Generate AI Data: ${finalInitialEmptyRows}`);
                   }
                 }
                 
@@ -399,6 +428,15 @@ export default function Monitor() {
             // If no skipped info yet, we'll update it when we get progress updates
             // For now, keep it as 0 and it will be updated when WebSocket sends skipped count
             console.log(`📊 Monitor: initialEmptyRows is 0, will be updated from WebSocket progress (total: ${initialStats.total})`);
+          }
+        } else if (stepName === "Generate AI Data") {
+          if (initialStats.skipped !== undefined && initialStats.skipped > 0) {
+            // For Generate AI Data, initialEmptyRows = total - skipped (rows that were already filled)
+            calculatedInitialEmptyRows = initialStats.total - initialStats.skipped;
+            console.log(`📊 Monitor: Calculated initialEmptyRows for Generate AI Data from skipped: ${calculatedInitialEmptyRows} (total: ${initialStats.total}, skipped: ${initialStats.skipped})`);
+          } else if (initialStats.total > 0) {
+            // If no skipped info yet, we'll update it when we get progress updates
+            console.log(`📊 Monitor: initialEmptyRows is 0 for Generate AI Data, will be updated from WebSocket progress (total: ${initialStats.total})`);
           }
         }
       }
@@ -514,9 +552,14 @@ export default function Monitor() {
               
               // Update initialEmptyRows if it's 0 and we now have skipped rows
               let updatedInitialEmptyRows = process.stats.initialEmptyRows;
-              if (updatedInitialEmptyRows === 0 && skipped > 0 && process.stepName === "Build Description") {
-                updatedInitialEmptyRows = total - skipped;
-                console.log(`📊 Monitor: Updated initialEmptyRows from progress: ${updatedInitialEmptyRows} (total: ${total}, skipped: ${skipped})`);
+              if (updatedInitialEmptyRows === 0 && skipped > 0) {
+                if (process.stepName === "Build Description" || process.stepName === "Generate AI Data") {
+                  updatedInitialEmptyRows = total - skipped;
+                  console.log(`📊 Monitor: Updated initialEmptyRows from progress: ${updatedInitialEmptyRows} (total: ${total}, skipped: ${skipped})`);
+                } else if (process.stepName === "AI Source Comparables") {
+                  updatedInitialEmptyRows = success;
+                  console.log(`📊 Monitor: Updated initialEmptyRows from progress: ${updatedInitialEmptyRows} (success: ${success})`);
+                }
               }
               
               const updatedProcess = {
@@ -619,9 +662,14 @@ export default function Monitor() {
 
               // Update initialEmptyRows if it's still 0
               let finalInitialEmptyRows = process.stats.initialEmptyRows;
-              if (finalInitialEmptyRows === 0 && skipped > 0 && process.stepName === "Build Description") {
-                finalInitialEmptyRows = total - skipped;
-                console.log(`📊 Monitor: Updated initialEmptyRows in complete handler: ${finalInitialEmptyRows} (total: ${total}, skipped: ${skipped})`);
+              if (finalInitialEmptyRows === 0 && skipped > 0) {
+                if (process.stepName === "Build Description" || process.stepName === "Generate AI Data") {
+                  finalInitialEmptyRows = total - skipped;
+                  console.log(`📊 Monitor: Updated initialEmptyRows in complete handler: ${finalInitialEmptyRows} (total: ${total}, skipped: ${skipped})`);
+                } else if (process.stepName === "AI Source Comparables") {
+                  finalInitialEmptyRows = success;
+                  console.log(`📊 Monitor: Updated initialEmptyRows in complete handler: ${finalInitialEmptyRows} (success: ${success})`);
+                }
               }
 
               const updatedProcess = {
