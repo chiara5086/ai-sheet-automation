@@ -195,7 +195,13 @@ async def process_step(request: ProcessRequest):
             print(f"  [{idx}] '{header}'", flush=True)
 
         # Select required columns per step
-        if step == "Build Description":
+        if step == "Generate AI Data":
+            required_names = [
+                r"YOM > OEM > MODEL",  # Asset name column starts with this
+                r"Raw Trusted Data",  # Previously "Technical Specifications"
+                r"AI Data"  # Column to fill
+            ]
+        elif step == "Build Description":
             required_names = [
                 r"YOM > OEM > MODEL",  # Asset name column starts with this
                 r"Raw Trusted Data",  # Previously "Technical Specifications"
@@ -265,7 +271,79 @@ async def process_step(request: ProcessRequest):
         updated_rows = rows
         custom_prompt = request.custom_prompt  # Get custom prompt if provided
         
-        if step == "Build Description":
+        if step == "Generate AI Data":
+            print(f"\n{'='*60}", flush=True)
+            print(f"DEBUG: Starting Generate AI Data", flush=True)
+            print(f"DEBUG: Processing {len(rows)} rows", flush=True)
+            print(f"{'='*60}\n", flush=True)
+            from process_steps import generate_ai_data
+            updated_rows, errors, ai_data_stats = await generate_ai_data(rows, col_indices, custom_prompt=custom_prompt, session_id=request.session_id)
+            print(f"\nDEBUG: generate_ai_data completed. {len(errors)} errors\n", flush=True)
+            
+            # Store stats for response BEFORE writing to sheet (so we can send WebSocket message early)
+            ai_data_stats_dict = ai_data_stats
+            
+            # Send WebSocket complete message EARLY, before writing to sheet
+            # This ensures the message is sent while WebSocket connections are still open
+            if request.session_id and ai_data_stats_dict:
+                stats = ai_data_stats_dict
+                filled = stats.get("success", 0)
+                errors_count = stats.get("errors_count", 0)
+                skipped = stats.get("skipped", 0)
+                
+                complete_message = {
+                    "type": "complete",
+                    "step": step,
+                    "total": len(rows),
+                    "processed": filled,
+                    "success": filled,
+                    "errors": errors_count,
+                    "skipped": skipped,
+                }
+                print(f"DEBUG: Sending WebSocket complete message EARLY to session {request.session_id}: {complete_message}", flush=True)
+                has_connection = manager.has_active_connection(request.session_id)
+                print(f"DEBUG: Active connections for session {request.session_id}: {has_connection}", flush=True)
+                
+                if has_connection:
+                    try:
+                        import asyncio
+                        await asyncio.sleep(0.1)
+                        await manager.broadcast_to_session(request.session_id, complete_message)
+                        print(f"DEBUG: WebSocket complete message sent successfully (early)", flush=True)
+                    except Exception as e:
+                        print(f"ERROR: Failed to send WebSocket complete message (early): {e}", flush=True)
+                        import traceback
+                        traceback.print_exc()
+                else:
+                    print(f"WARNING: No active WebSocket connections for session {request.session_id} (early send), message not sent", flush=True)
+            
+            # Write back only the AI Data column
+            ai_data_idx = col_indices.get('AI Data')
+            if ai_data_idx is not None:
+                col_letter = get_column_letter(ai_data_idx)
+                start_row = 3
+                end_row = start_row + len(updated_rows) - 1
+                out_range = f"{sheet_name}!{col_letter}{start_row}:{col_letter}{end_row}" if sheet_name else f"{col_letter}{start_row}:{col_letter}{end_row}"
+                values = [[row[ai_data_idx] if len(row) > ai_data_idx else ""] for row in updated_rows]
+                
+                # Count how many non-empty values we're writing
+                non_empty_count = sum(1 for v in values if v and v[0] and str(v[0]).strip())
+                print(f"DEBUG: Writing AI Data to sheet: {non_empty_count} non-empty values out of {len(values)} total", flush=True)
+                print(f"DEBUG: Range: {out_range}, Column: {col_letter}", flush=True)
+                
+                try:
+                    update_sheet_data(sheetId, out_range, values)
+                    print(f"✅ Successfully wrote AI Data to sheet", flush=True)
+                except Exception as e:
+                    error_msg = f'Failed to write AI Data to sheet: {str(e)}'
+                    print(f"❌ ERROR: {error_msg}", flush=True)
+                    errors.append(error_msg)
+                    import traceback
+                    traceback.print_exc()
+            else:
+                print(f"WARNING: AI Data column index not found, cannot write to sheet", flush=True)
+            
+        elif step == "Build Description":
             # Count rows that were already filled before processing
             desc_idx = col_indices.get('Script Technical Description')
             already_filled_count = 0
@@ -313,7 +391,7 @@ async def process_step(request: ProcessRequest):
             print(f"DEBUG: Processing {len(rows)} rows", flush=True)
             print(f"{'='*60}\n", flush=True)
             from process_steps import ai_source_comparables
-            updated_rows, errors, comparables_stats = ai_source_comparables(rows, col_indices, custom_prompt=custom_prompt, session_id=request.session_id)
+            updated_rows, errors, comparables_stats = await ai_source_comparables(rows, col_indices, custom_prompt=custom_prompt, session_id=request.session_id)
             print(f"\nDEBUG: ai_source_comparables completed. {len(errors)} errors\n", flush=True)
             # Store stats for response BEFORE writing to sheet (so we can send WebSocket message early)
             comparables_stats_dict = comparables_stats
@@ -368,7 +446,7 @@ async def process_step(request: ProcessRequest):
             print(f"DEBUG: Processing {len(rows)} rows", flush=True)
             print(f"{'='*60}\n", flush=True)
             from process_steps import extract_final_price
-            updated_rows, errors, filled_rows = extract_final_price(rows, col_indices, custom_prompt=custom_prompt)
+            updated_rows, errors, filled_rows = await extract_final_price(rows, col_indices, custom_prompt=custom_prompt, session_id=request.session_id)
             print(f"\nDEBUG: extract_final_price completed. Filled {len(filled_rows)} rows, {len(errors)} errors\n", flush=True)
             # Write back only the price column - but only update rows that were actually filled
             price_idx = col_indices.get('Price')
@@ -411,7 +489,7 @@ async def process_step(request: ProcessRequest):
             print(f"DEBUG: Processing {len(rows)} rows", flush=True)
             print(f"{'='*60}\n", flush=True)
             from process_steps import ai_source_new_price
-            updated_rows, errors, filled_rows = ai_source_new_price(rows, col_indices, custom_prompt=custom_prompt)
+            updated_rows, errors, filled_rows = await ai_source_new_price(rows, col_indices, custom_prompt=custom_prompt, session_id=request.session_id)
             print(f"\nDEBUG: ai_source_new_price completed. Filled {len(filled_rows)} rows, {len(errors)} errors\n", flush=True)
             # Write back only the price column - but only update rows that were actually filled
             price_idx = col_indices.get('Price')
@@ -454,7 +532,7 @@ async def process_step(request: ProcessRequest):
             print(f"DEBUG: Processing {len(rows)} rows", flush=True)
             print(f"{'='*60}\n", flush=True)
             from process_steps import ai_similar_comparable
-            updated_rows, errors, filled_rows = ai_similar_comparable(rows, col_indices, custom_prompt=custom_prompt)
+            updated_rows, errors, filled_rows = await ai_similar_comparable(rows, col_indices, custom_prompt=custom_prompt, session_id=request.session_id)
             print(f"\nDEBUG: ai_similar_comparable completed. Filled {len(filled_rows)} rows, {len(errors)} errors\n", flush=True)
             # Write back only the price column - but only update rows that were actually filled
             price_idx = col_indices.get('Price')
@@ -511,7 +589,9 @@ async def process_step(request: ProcessRequest):
         }
         
         # Add stats based on step type
-        if step == "Build Description" and 'build_description_stats' in locals():
+        if step == "Generate AI Data" and 'ai_data_stats_dict' in locals():
+            response_data["stats"] = ai_data_stats_dict
+        elif step == "Build Description" and 'build_description_stats' in locals():
             response_data["stats"] = build_description_stats
         elif step == "AI Source Comparables" and 'comparables_stats_dict' in locals():
             response_data["stats"] = comparables_stats_dict
@@ -527,17 +607,22 @@ async def process_step(request: ProcessRequest):
             }
         
         # Send completion update via WebSocket with final stats
-        # NOTE: For "AI Source Comparables", the message is already sent early (before writing to sheet)
+        # NOTE: For "AI Source Comparables" and "Generate AI Data", the message is already sent early (before writing to sheet)
         # For other steps, send it here
-        if request.session_id and step != "AI Source Comparables":
+        if request.session_id and step not in ["AI Source Comparables", "Generate AI Data"]:
             stats = response_data.get("stats", {})
             # Calculate skipped: rows that were already filled before processing
             # For Build Description: skipped = total - filled (newly filled) - errors
+            # For Generate AI Data: use stats from the function
             # For other steps: use stats.skipped if available, otherwise calculate
             if step == "Build Description":
                 filled = stats.get("filled", 0)
                 errors_count = stats.get("errors_count", 0)
                 skipped = len(rows) - filled - errors_count
+            elif step == "Generate AI Data":
+                filled = stats.get("success", 0)
+                errors_count = stats.get("errors_count", 0)
+                skipped = stats.get("skipped", 0)
             else:
                 filled = stats.get("filled", 0) or len(response_data.get("filled_rows", []))
                 errors_count = stats.get("errors_count", 0) or len(errors)

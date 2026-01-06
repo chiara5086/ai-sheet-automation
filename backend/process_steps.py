@@ -105,7 +105,7 @@ async def generate_ai_data(rows, col_indices, session_id=None, custom_prompt=Non
             - errors: List of error messages encountered during processing
             - stats: Dictionary with processing statistics
     """
-    print("DEBUG: generate_ai_data function called")
+    print("DEBUG: generate_ai_data function called", flush=True)
     import google.generativeai as genai
     from config import GEMINI_API_KEY
     import re
@@ -113,7 +113,7 @@ async def generate_ai_data(rows, col_indices, session_id=None, custom_prompt=Non
     # Gemini is required for this step
     if not GEMINI_API_KEY:
         error_msg = 'Gemini API key required. Please set GEMINI_API_KEY in your .env file.'
-        print(f"ERROR: {error_msg}")
+        print(f"ERROR: {error_msg}", flush=True)
         return rows, [error_msg], {"total": len(rows), "processed": 0, "success": 0, "skipped": 0, "errors_count": 1}
     
     api_key_clean = GEMINI_API_KEY.strip()
@@ -130,15 +130,17 @@ async def generate_ai_data(rows, col_indices, session_id=None, custom_prompt=Non
         return rows, [error_msg], {"total": len(rows), "processed": 0, "success": 0, "skipped": 0, "errors_count": 1}
     
     key_preview = f"{api_key_clean[:10]}...{api_key_clean[-4:]}" if len(api_key_clean) > 14 else "***"
-    print(f"DEBUG: ✅ Using Gemini API for AI Data generation (key preview: {key_preview}, length: {len(api_key_clean)})")
+    print(f"DEBUG: ✅ Using Gemini API for AI Data generation (key preview: {key_preview}, length: {len(api_key_clean)})", flush=True)
     
     try:
-        print(f"DEBUG: Initializing Gemini client...")
+        print(f"DEBUG: Initializing Gemini client...", flush=True)
         genai.configure(api_key=api_key_clean)
-        print(f"DEBUG: Gemini client initialized successfully")
+        print(f"DEBUG: Gemini client initialized successfully", flush=True)
     except Exception as e:
         error_msg = f'Failed to initialize API client: {str(e)}'
-        print(f"ERROR: {error_msg}")
+        print(f"ERROR: {error_msg}", flush=True)
+        import traceback
+        traceback.print_exc()
         return rows, [error_msg], {"total": len(rows), "processed": 0, "success": 0, "skipped": 0, "errors_count": 1}
     
     errors = []
@@ -218,8 +220,8 @@ async def generate_ai_data(rows, col_indices, session_id=None, custom_prompt=Non
         rows_to_process.append((i, row, row_num, asset, tech))
     
     total_to_process = len(rows_to_process)
-    print(f"DEBUG: Starting to process {total_to_process} rows (out of {len(rows)} total) for AI Data generation...")
-    print(f"DEBUG: Skipped {skipped_filled} rows (already filled), {skipped_missing_data} rows (missing data)")
+    print(f"DEBUG: Starting to process {total_to_process} rows (out of {len(rows)} total) for AI Data generation...", flush=True)
+    print(f"DEBUG: Skipped {skipped_filled} rows (already filled), {skipped_missing_data} rows (missing data)", flush=True)
     
     # Process in parallel batches of 20
     import asyncio
@@ -268,18 +270,25 @@ Raw Trusted Data: {tech}"""
             
             # Gemini doesn't have native async, so we run it in executor
             def call_gemini():
-                model = genai.GenerativeModel('gemini-2.5-flash')
-                response = model.generate_content(
-                    prompt,
-                    generation_config=genai.types.GenerationConfig(
-                        temperature=0.3,
-                        max_output_tokens=2000,
+                try:
+                    model = genai.GenerativeModel('gemini-2.5-flash')
+                    response = model.generate_content(
+                        prompt,
+                        generation_config=genai.types.GenerationConfig(
+                            temperature=0.3,
+                            max_output_tokens=2000,
+                        )
                     )
-                )
-                return response.text if response.text else ""
+                    return response.text if response.text else ""
+                except Exception as gemini_error:
+                    print(f"❌ Row {row_num}: Gemini API error: {str(gemini_error)}", flush=True)
+                    import traceback
+                    traceback.print_exc()
+                    raise  # Re-raise to be caught by outer try/except
             
             ai_data_text = await loop.run_in_executor(None, call_gemini)
             ai_data_text = ai_data_text.strip()
+            print(f"DEBUG: Row {row_num}: Gemini response received ({len(ai_data_text)} chars)", flush=True)
             
             # Filter out explanatory responses
             is_explanation = any(phrase in ai_data_text.lower() for phrase in [
@@ -302,7 +311,7 @@ Raw Trusted Data: {tech}"""
                     return (i, row_num, cleaned_text, None)
                 else:
                     # Log what was filtered out for debugging
-                    print(f"⚠️ Row {row_num}: Filtered out response (length: {len(cleaned_text.strip()) if cleaned_text else 0}): {cleaned_text[:100] if cleaned_text else 'None'}...")
+                    print(f"⚠️ Row {row_num}: Filtered out response (length: {len(cleaned_text.strip()) if cleaned_text else 0}): {cleaned_text[:100] if cleaned_text else 'None'}...", flush=True)
                     return (i, row_num, None, None)  # No meaningful data after cleaning
             else:
                 return (i, row_num, None, None)  # No data found, but not an error
@@ -314,6 +323,13 @@ Raw Trusted Data: {tech}"""
                 error_code = e.status_code
             elif hasattr(e, 'response') and hasattr(e.response, 'status_code'):
                 error_code = e.response.status_code
+            
+            # Log error with full details
+            print(f"❌ Row {row_num}: Exception during processing: {error_detail}", flush=True)
+            if error_code:
+                print(f"   Error code: {error_code}", flush=True)
+            import traceback
+            traceback.print_exc()
             
             return (i, row_num, None, (error_code, error_detail))
     
@@ -442,11 +458,11 @@ Raw Trusted Data: {tech}"""
             print(f"❌ {error_msg}")
         elif ai_data_text:
             success_count += 1
-            print(f"✅ Row {row_num}: Successfully generated AI Data ({len(ai_data_text)} chars)")
+            print(f"✅ Row {row_num}: Successfully generated AI Data ({len(ai_data_text)} chars)", flush=True)
         else:
             # Row processed but no meaningful data after cleaning
             no_data_count += 1
-            print(f"⚠️ Row {row_num}: No meaningful data found after processing (may have been filtered out)")
+            print(f"⚠️ Row {row_num}: No meaningful data found after processing (may have been filtered out)", flush=True)
     
     print(f"\n📊 Processing Summary:")
     print(f"  - Total rows processed: {len(rows)}")
