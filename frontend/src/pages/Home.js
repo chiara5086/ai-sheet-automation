@@ -1214,7 +1214,7 @@ export default function Home() {
           )}
 
           {/* Process Steps Section */}
-          {sheetHeaders.length > 0 && (
+          {sheetHeaders.length > 0 && sheetRows.length > 0 && sheetName && sheetUrl && (
             <>
               <Card sx={{ mb: 4, borderRadius: 2, boxShadow: 3 }}>
               <CardContent sx={{ p: 3 }}>
