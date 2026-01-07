@@ -26,11 +26,12 @@ export default function DetailedProgressMonitor({
   elapsedTime,
   isCompleted,
   isActive,
+  isCancelled,
   onRemove,
   onMarkAsCompleted,
   progress: progressProp,
 }) {
-  if (!isActive && !isCompleted) {
+  if (!isActive && !isCompleted && !isCancelled) {
     return null;
   }
 
@@ -47,7 +48,22 @@ export default function DetailedProgressMonitor({
   const skipped = stats.skipped || 0;
   const emptyRows = stats.initialEmptyRows || 0;
   // Use progress from prop if provided, otherwise calculate
-  const progress = progressProp !== undefined ? progressProp : (total > 0 ? ((success + skipped) / total) * 100 : 0);
+  // Progress should be based on empty rows being processed, not total rows
+  // Only show empty rows chip when we have the correct value from backend (skipped has been calculated)
+  // skipped can be 0 or any number, but it must be defined (not undefined) to indicate backend calculated it
+  // Don't show if skipped is undefined (meaning we haven't received the correct value from backend yet)
+  // This prevents showing "224 empty rows" initially when it should be "60 empty rows" after backend calculates skipped
+  const hasCorrectEmptyRows = skipped !== undefined && emptyRows > 0;
+  let progress = 0;
+  if (progressProp !== undefined) {
+    progress = progressProp;
+  } else if (emptyRows > 0) {
+    // Calculate progress based on empty rows: (success / emptyRows) * 100
+    progress = (success / emptyRows) * 100;
+  } else if (total > 0) {
+    // Fallback: if emptyRows not calculated yet, use total (but this should be temporary)
+    progress = ((success + skipped) / total) * 100;
+  }
   
   // Debug log for empty rows (only log once, not on every render)
   React.useEffect(() => {
@@ -70,7 +86,12 @@ export default function DetailedProgressMonitor({
         <Box sx={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', mb: 2 }}>
           <Box sx={{ flex: 1 }}>
             <Typography variant="h6" sx={{ fontWeight: 600, mb: 1, display: 'flex', alignItems: 'center', gap: 1 }}>
-              {isCompleted ? (
+              {isCancelled ? (
+                <>
+                  <ErrorIcon sx={{ color: '#ef4444', fontSize: 24 }} />
+                  Cancelled: {stepName}
+                </>
+              ) : isCompleted ? (
                 <>
                   <CheckCircleIcon sx={{ color: '#10b981', fontSize: 24 }} />
                   Completed: {stepName}
@@ -206,7 +227,7 @@ export default function DetailedProgressMonitor({
         </Grid>
 
         <Box sx={{ mt: 2, display: 'flex', gap: 1, flexWrap: 'wrap' }}>
-          {emptyRows > 0 && (
+          {hasCorrectEmptyRows && emptyRows > 0 && (
             <Chip
               icon={<HourglassEmptyIcon />}
               label={`${emptyRows} empty rows`}

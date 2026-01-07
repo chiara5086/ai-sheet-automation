@@ -37,8 +37,20 @@ export default function RealTimeProgress({
   const skipped = stats.skipped || 0;
   // Use initial empty rows count (fixed at start) instead of recalculating
   const emptyRows = stats.initialEmptyRows || 0;
-  // Progress should be based on completed rows (success) not just processed
-  const progress = total > 0 ? ((success + skipped) / total) * 100 : 0;
+  // Progress should be based on empty rows being processed, not total rows
+  // Only show empty rows chip when we have the correct value from backend (skipped has been calculated)
+  // skipped can be 0 or any number, but it must be defined (not undefined) to indicate backend calculated it
+  // Don't show if skipped is undefined (meaning we haven't received the correct value from backend yet)
+  // This prevents showing "224 empty rows" initially when it should be "60 empty rows" after backend calculates skipped
+  const hasCorrectEmptyRows = skipped !== undefined && emptyRows > 0;
+  let progress = 0;
+  if (emptyRows > 0) {
+    // Calculate progress based on empty rows: (success / emptyRows) * 100
+    progress = (success / emptyRows) * 100;
+  } else if (total > 0) {
+    // Fallback: if emptyRows not calculated yet, use total (but this should be temporary)
+    progress = ((success + skipped) / total) * 100;
+  }
 
   return (
     <Card
@@ -159,7 +171,7 @@ export default function RealTimeProgress({
         </Grid>
 
         <Box sx={{ mt: 2, display: 'flex', gap: 1, flexWrap: 'wrap' }}>
-          {emptyRows > 0 && (
+          {hasCorrectEmptyRows && emptyRows > 0 && (
             <Chip
               icon={<HourglassEmptyIcon />}
               label={`${emptyRows} empty rows`}

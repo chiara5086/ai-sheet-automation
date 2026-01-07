@@ -296,6 +296,25 @@ export default function Home() {
               setTimeout(() => {
                 localStorage.setItem('homeProcesses', JSON.stringify(updated));
                 console.log(`💾 Home: Force-saved completed process ${processId} to localStorage`);
+                
+                // Dispatch processCompleted event for Monitor to sync
+                window.dispatchEvent(new CustomEvent('processCompleted', {
+                  detail: {
+                    processId,
+                    stepName: data.step || process.stepName,
+                    sheetName: finalSheetName,
+                    stats: {
+                      total: data.total || process.stats.total,
+                      processed: data.processed || data.success || 0,
+                      success: data.success || 0,
+                      errors: data.errors || 0,
+                      skipped: data.skipped || 0,
+                      initialEmptyRows: process.stats.initialEmptyRows,
+                    },
+                    elapsedTime: finalElapsedTime,
+                  }
+                }));
+                console.log(`📢 Home: Dispatched processCompleted event for ${processId}`);
               }, 0);
               
               return updated;
@@ -693,18 +712,11 @@ export default function Home() {
         console.warn(`⚠️ Home: Could not find 'Script Technical Description' column for calculating initialEmptyRows`);
       }
     } else if (stepName === "Generate AI Data" && sheetRows.length > 0) {
-      const aiDataHeaderIndex = sheetHeaders.findIndex(h => 
-        h && h.toLowerCase().includes('ai data')
-      );
-      if (aiDataHeaderIndex >= 0) {
-        initialEmptyRows = sheetRows.filter(row => {
-          const aiDataValue = row[aiDataHeaderIndex];
-          return !aiDataValue || !String(aiDataValue).trim();
-        }).length;
-        console.log(`📊 Home: Calculated initialEmptyRows: ${initialEmptyRows} for step "${stepName}"`);
-      } else {
-        console.warn(`⚠️ Home: Could not find 'AI Data' column for calculating initialEmptyRows`);
-      }
+      // For Generate AI Data, don't calculate initialEmptyRows from frontend
+      // It will be calculated correctly in Monitor.js using backend data (total - skipped)
+      // This avoids incorrect counts when sheetRows doesn't have all rows or filtering is wrong
+      initialEmptyRows = 0;
+      console.log(`📊 Home: Leaving initialEmptyRows as 0 for "${stepName}" - will be calculated from backend data`);
     } else {
       console.log(`📊 Home: Skipping initialEmptyRows calculation (stepName: "${stepName}", sheetRows.length: ${sheetRows.length})`);
     }

@@ -105,7 +105,7 @@ async def generate_ai_data(rows, col_indices, session_id=None, custom_prompt=Non
             - errors: List of error messages encountered during processing
             - stats: Dictionary with processing statistics
     """
-    print("DEBUG: generate_ai_data function called", flush=True)
+    print("DEBUG: generate_ai_data function called")
     import google.generativeai as genai
     from config import GEMINI_API_KEY
     import re
@@ -113,7 +113,7 @@ async def generate_ai_data(rows, col_indices, session_id=None, custom_prompt=Non
     # Gemini is required for this step
     if not GEMINI_API_KEY:
         error_msg = 'Gemini API key required. Please set GEMINI_API_KEY in your .env file.'
-        print(f"ERROR: {error_msg}", flush=True)
+        print(f"ERROR: {error_msg}")
         return rows, [error_msg], {"total": len(rows), "processed": 0, "success": 0, "skipped": 0, "errors_count": 1}
     
     api_key_clean = GEMINI_API_KEY.strip()
@@ -130,17 +130,15 @@ async def generate_ai_data(rows, col_indices, session_id=None, custom_prompt=Non
         return rows, [error_msg], {"total": len(rows), "processed": 0, "success": 0, "skipped": 0, "errors_count": 1}
     
     key_preview = f"{api_key_clean[:10]}...{api_key_clean[-4:]}" if len(api_key_clean) > 14 else "***"
-    print(f"DEBUG: ✅ Using Gemini API for AI Data generation (key preview: {key_preview}, length: {len(api_key_clean)})", flush=True)
+    print(f"DEBUG: ✅ Using Gemini API for AI Data generation (key preview: {key_preview}, length: {len(api_key_clean)})")
     
     try:
-        print(f"DEBUG: Initializing Gemini client...", flush=True)
+        print(f"DEBUG: Initializing Gemini client...")
         genai.configure(api_key=api_key_clean)
-        print(f"DEBUG: Gemini client initialized successfully", flush=True)
+        print(f"DEBUG: Gemini client initialized successfully")
     except Exception as e:
         error_msg = f'Failed to initialize API client: {str(e)}'
-        print(f"ERROR: {error_msg}", flush=True)
-        import traceback
-        traceback.print_exc()
+        print(f"ERROR: {error_msg}")
         return rows, [error_msg], {"total": len(rows), "processed": 0, "success": 0, "skipped": 0, "errors_count": 1}
     
     errors = []
@@ -270,51 +268,111 @@ Raw Trusted Data: {tech}"""
             
             # Gemini doesn't have native async, so we run it in executor
             def call_gemini():
-                try:
-                    model = genai.GenerativeModel('gemini-2.5-flash')
-                    response = model.generate_content(
-                        prompt,
-                        generation_config=genai.types.GenerationConfig(
-                            temperature=0.3,
-                            max_output_tokens=2000,
-                        )
+                model = genai.GenerativeModel('gemini-2.5-flash')
+                response = model.generate_content(
+                    prompt,
+                    generation_config=genai.types.GenerationConfig(
+                        temperature=0.3,
+                        max_output_tokens=8000,  # Increased from 2000 to handle longer responses
                     )
-                    return response.text if response.text else ""
-                except Exception as gemini_error:
-                    print(f"❌ Row {row_num}: Gemini API error: {str(gemini_error)}", flush=True)
-                    import traceback
-                    traceback.print_exc()
-                    raise  # Re-raise to be caught by outer try/except
+                )
+                # Check if response was truncated due to token limit
+                if hasattr(response, 'candidates') and response.candidates:
+                    candidate = response.candidates[0]
+                    if hasattr(candidate, 'finish_reason'):
+                        if candidate.finish_reason == 2:  # MAX_TOKENS - response was truncated
+                            print(f"DEBUG: Row {row_num}: Warning - Response may be truncated (finish_reason=MAX_TOKENS)")
+                        elif candidate.finish_reason == 3:  # SAFETY - blocked by safety filters
+                            print(f"DEBUG: Row {row_num}: Warning - Response blocked by safety filters (finish_reason=SAFETY)")
+                
+                return response.text if response.text else ""
             
             ai_data_text = await loop.run_in_executor(None, call_gemini)
-            ai_data_text = ai_data_text.strip()
-            print(f"DEBUG: Row {row_num}: Gemini response received ({len(ai_data_text)} chars)", flush=True)
             
-            # Filter out explanatory responses
-            is_explanation = any(phrase in ai_data_text.lower() for phrase in [
-                "i need to clarify", "i cannot", "limitation", "i appreciate",
-                "i need to", "according to my instructions", "would you like me",
-                "cannot generate", "do not contain", "search results provided"
-            ])
+            # Check if process was cancelled after processing (before saving)
+            if session_id:
+                from websocket_manager import manager
+                if manager.is_cancelled(session_id):
+                    print(f"DEBUG: Row {row_num}: Process cancelled, skipping result", flush=True)
+                    return None  # Return None to skip this row
+            
+            if not ai_data_text:
+                print(f"DEBUG: Row {row_num}: Empty response from Gemini - saving empty string")
+                # Save empty string instead of skipping
+                while len(row) <= ai_data_idx:
+                    row.append("")
+                row[ai_data_idx] = ""
+                return (i, row_num, "", None)
+            
+            ai_data_text = ai_data_text.strip()
+            
+            # Log raw response length for debugging
+            print(f"DEBUG: Row {row_num}: Gemini raw response length: {len(ai_data_text)} chars")
+            if len(ai_data_text) > 0:
+                print(f"DEBUG: Row {row_num}: Gemini raw response preview: {ai_data_text[:200]}...")
+            
+            # Only filter out truly explanatory responses that don't contain any specs
+            # But accept "No official OEM specifications found." as valid
+            is_explanation = False
+            if ai_data_text.lower().strip() != "no official oem specifications found.":
+                is_explanation = any(phrase in ai_data_text.lower() for phrase in [
+                    "i need to clarify", "i cannot", "limitation", "i appreciate",
+                    "according to my instructions", "would you like me",
+                    "cannot generate"
+                ]) and not any(char.isdigit() for char in ai_data_text)  # Only filter if no numbers (no specs)
             
             if ai_data_text and not is_explanation:
                 # Clean the response: remove unwanted elements
                 cleaned_text = clean_ai_data_response(ai_data_text)
                 
-                # Only save if we have meaningful content after cleaning
-                # Lowered threshold from 20 to 10 characters to be less strict
-                if cleaned_text and cleaned_text.strip() and len(cleaned_text.strip()) > 10:
+                # Log cleaned response length for debugging
+                print(f"DEBUG: Row {row_num}: After cleaning, length: {len(cleaned_text.strip()) if cleaned_text else 0} chars")
+                
+                # Check if process was cancelled before saving
+                if session_id:
+                    from websocket_manager import manager
+                    if manager.is_cancelled(session_id):
+                        print(f"DEBUG: Row {row_num}: Process cancelled, skipping result", flush=True)
+                        return None  # Return None to skip this row
+                
+                # Save ANY response, even if it's short or says "No official OEM specifications found."
+                # This ensures all rows are processed
+                if cleaned_text and cleaned_text.strip():
                     # Ensure row has enough columns
                     while len(row) <= ai_data_idx:
                         row.append("")
                     row[ai_data_idx] = cleaned_text
+                    print(f"DEBUG: Row {row_num}: Successfully saved AI Data ({len(cleaned_text)} chars)")
                     return (i, row_num, cleaned_text, None)
                 else:
-                    # Log what was filtered out for debugging
-                    print(f"⚠️ Row {row_num}: Filtered out response (length: {len(cleaned_text.strip()) if cleaned_text else 0}): {cleaned_text[:100] if cleaned_text else 'None'}...", flush=True)
-                    return (i, row_num, None, None)  # No meaningful data after cleaning
+                    # Even if cleaning removed everything, save the original response
+                    # This ensures we don't skip rows
+                    while len(row) <= ai_data_idx:
+                        row.append("")
+                    row[ai_data_idx] = ai_data_text  # Save original if cleaning removed everything
+                    print(f"DEBUG: Row {row_num}: Saved original response after cleaning removed content ({len(ai_data_text)} chars)")
+                    return (i, row_num, ai_data_text, None)
             else:
-                return (i, row_num, None, None)  # No data found, but not an error
+                # Check if process was cancelled before saving
+                if session_id:
+                    from websocket_manager import manager
+                    if manager.is_cancelled(session_id):
+                        print(f"DEBUG: Row {row_num}: Process cancelled, skipping result", flush=True)
+                        return None  # Return None to skip this row
+                
+                if is_explanation:
+                    print(f"DEBUG: Row {row_num}: Response filtered as explanation - but saving anyway to ensure all rows processed")
+                    # Save anyway to ensure all rows are processed
+                    while len(row) <= ai_data_idx:
+                        row.append("")
+                    row[ai_data_idx] = ai_data_text
+                    return (i, row_num, ai_data_text, None)
+                else:
+                    # Save empty string if no response
+                    while len(row) <= ai_data_idx:
+                        row.append("")
+                    row[ai_data_idx] = ""
+                    return (i, row_num, "", None)
         except Exception as e:
             error_detail = str(e)
             error_code = None
@@ -323,13 +381,6 @@ Raw Trusted Data: {tech}"""
                 error_code = e.status_code
             elif hasattr(e, 'response') and hasattr(e.response, 'status_code'):
                 error_code = e.response.status_code
-            
-            # Log error with full details
-            print(f"❌ Row {row_num}: Exception during processing: {error_detail}", flush=True)
-            if error_code:
-                print(f"   Error code: {error_code}", flush=True)
-            import traceback
-            traceback.print_exc()
             
             return (i, row_num, None, (error_code, error_detail))
     
@@ -391,6 +442,11 @@ Raw Trusted Data: {tech}"""
                     await manager.broadcast_to_session(session_id, {
                         "type": "cancelled",
                         "step": "Generate AI Data",
+                        "total": len(rows),
+                        "processed": progress_counter["success"] + progress_counter["errors"],
+                        "success": progress_counter["success"],
+                        "errors": progress_counter["errors"],
+                        "skipped": skipped_filled,
                         "message": "Process was cancelled by user"
                     })
                 break
@@ -458,11 +514,11 @@ Raw Trusted Data: {tech}"""
             print(f"❌ {error_msg}")
         elif ai_data_text:
             success_count += 1
-            print(f"✅ Row {row_num}: Successfully generated AI Data ({len(ai_data_text)} chars)", flush=True)
+            print(f"✅ Row {row_num}: Successfully generated AI Data ({len(ai_data_text)} chars)")
         else:
             # Row processed but no meaningful data after cleaning
             no_data_count += 1
-            print(f"⚠️ Row {row_num}: No meaningful data found after processing (may have been filtered out)", flush=True)
+            print(f"⚠️ Row {row_num}: No meaningful data found after processing (may have been filtered out)")
     
     print(f"\n📊 Processing Summary:")
     print(f"  - Total rows processed: {len(rows)}")
@@ -765,6 +821,11 @@ Raw Trusted Data: {tech}{ai_data_section}"""
                     await manager.broadcast_to_session(session_id, {
                         "type": "cancelled",
                         "step": "Build Description",
+                        "total": len(rows),
+                        "processed": progress_counter["success"] + progress_counter["errors"],
+                        "success": progress_counter["success"],
+                        "errors": progress_counter["errors"],
+                        "skipped": skipped_filled,
                         "message": "Process was cancelled by user"
                     })
                 break
@@ -1129,6 +1190,11 @@ Raw Trusted Data: {tech}{ai_data_section}"""
                     await manager.broadcast_to_session(session_id, {
                         "type": "cancelled",
                         "step": "AI Source Comparables",
+                        "total": len(rows),
+                        "processed": progress_counter["success"] + progress_counter["errors"],
+                        "success": progress_counter["success"],
+                        "errors": progress_counter["errors"],
+                        "skipped": skipped_filled,
                         "message": "Process was cancelled by user"
                     })
                 break
@@ -1417,7 +1483,7 @@ async def extract_final_price(rows, col_indices, custom_prompt=None, session_id=
 
 Reference information (these values will be automatically filled from the sheet columns):
 Asset Name: {asset}
-Raw Trusted Data: {tech_specs}
+Raw Trusted Data: {tech}
 AI Comparable Price: {comparable}{ai_data_section}"""
         
         try:

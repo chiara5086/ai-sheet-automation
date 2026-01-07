@@ -412,38 +412,40 @@ export default function Monitor() {
         }
       }
       
-      // Calculate initialEmptyRows if not provided or is 0
-      // This handles the case where Home sends initialEmptyRows: 0 or when we get updates from WebSocket
-      let calculatedInitialEmptyRows = initialStats?.initialEmptyRows || 0;
+      // For Generate AI Data and Build Description, wait for backend to calculate skipped before showing empty rows
+      // This ensures we show the correct value once, without it changing
+      let calculatedInitialEmptyRows = 0;
       
-      // If initialEmptyRows is 0, try to calculate it
-      if (calculatedInitialEmptyRows === 0 && initialStats?.total !== undefined) {
-        // For Build Description, we can calculate from skipped rows if available
-        if (stepName === "Build Description") {
-          if (initialStats.skipped !== undefined && initialStats.skipped > 0) {
-            // If we have skipped rows, initialEmptyRows = total - skipped
-            calculatedInitialEmptyRows = initialStats.total - initialStats.skipped;
-            console.log(`📊 Monitor: Calculated initialEmptyRows from skipped: ${calculatedInitialEmptyRows} (total: ${initialStats.total}, skipped: ${initialStats.skipped})`);
-          } else if (initialStats.total > 0) {
-            // If no skipped info yet, we'll update it when we get progress updates
-            // For now, keep it as 0 and it will be updated when WebSocket sends skipped count
-            console.log(`📊 Monitor: initialEmptyRows is 0, will be updated from WebSocket progress (total: ${initialStats.total})`);
+      // Only calculate if we have skipped from backend (indicates backend has calculated it)
+      // If skipped is undefined or not yet received, wait for first progress message
+      // Don't calculate initialEmptyRows if skipped is 0 and we haven't received confirmation from backend
+      // This prevents showing "224 empty rows" initially when it should be "60 empty rows"
+      if (initialStats?.total !== undefined && initialStats?.skipped !== undefined) {
+        if (stepName === "Build Description" || stepName === "Generate AI Data") {
+          // Only calculate if skipped is not 0 OR if we have a non-zero total (meaning backend has calculated it)
+          // If skipped is 0 and total is the same as initialEmptyRows would be, wait for backend confirmation
+          const calculated = initialStats.total - initialStats.skipped;
+          // If skipped is 0 and calculated equals total, this might be a default value, not from backend
+          // So we'll wait for the first progress message to confirm
+          if (initialStats.skipped === 0 && calculated === initialStats.total) {
+            // This is likely a default value, wait for backend
+            console.log(`📊 Monitor: Skipped is 0 and would result in emptyRows=total, waiting for backend confirmation (total: ${initialStats.total})`);
+            calculatedInitialEmptyRows = 0; // Don't show chip until backend confirms
+          } else {
+            // Use backend data: initialEmptyRows = total - skipped (rows that were empty at start)
+            calculatedInitialEmptyRows = calculated;
+            console.log(`📊 Monitor: Using backend data for initialEmptyRows: ${calculatedInitialEmptyRows} (total: ${initialStats.total}, skipped: ${initialStats.skipped})`);
           }
-        } else if (stepName === "Generate AI Data") {
-          if (initialStats.skipped !== undefined && initialStats.skipped > 0) {
-            // For Generate AI Data, initialEmptyRows = total - skipped (rows that were already filled)
-            calculatedInitialEmptyRows = initialStats.total - initialStats.skipped;
-            console.log(`📊 Monitor: Calculated initialEmptyRows for Generate AI Data from skipped: ${calculatedInitialEmptyRows} (total: ${initialStats.total}, skipped: ${initialStats.skipped})`);
-          } else if (initialStats.total > 0) {
-            // If no skipped info yet, we'll update it when we get progress updates
-            console.log(`📊 Monitor: initialEmptyRows is 0 for Generate AI Data, will be updated from WebSocket progress (total: ${initialStats.total})`);
+        } else if (stepName === "AI Source Comparables") {
+          // For AI Source Comparables, use success count
+          if (initialStats.success !== undefined && initialStats.success > 0) {
+            calculatedInitialEmptyRows = initialStats.success;
+            console.log(`📊 Monitor: Calculated initialEmptyRows for AI Source Comparables from success: ${calculatedInitialEmptyRows}`);
           }
         }
-      }
-      
-      // Log the final value
-      if (calculatedInitialEmptyRows > 0) {
-        console.log(`✅ Monitor: Using initialEmptyRows: ${calculatedInitialEmptyRows} for process ${processId}`);
+      } else {
+        // Wait for first progress message from backend to get correct skipped value
+        console.log(`📊 Monitor: Waiting for backend to calculate skipped before showing empty rows (total: ${initialStats?.total || 'unknown'})`);
       }
       
       const newProcess = {
@@ -521,10 +523,44 @@ export default function Monitor() {
               const skipped = data.skipped ?? 0;
               const processed = data.processed ?? (success || 0);
               
-              // Calculate progress: (success + skipped) / total * 100
-              const progress = total > 0 
-                ? Math.min(100, ((success + skipped) / total) * 100)
-                : 0;
+              // Update initialEmptyRows when we receive first progress message with skipped from backend
+              // This ensures we show the correct value once, without it changing
+              let updatedInitialEmptyRows = process.stats.initialEmptyRows;
+              if (process.stepName === "Build Description" || process.stepName === "Generate AI Data") {
+                // Always update if we have valid skipped value from backend (even if it's 0)
+                // The key is: if we haven't received skipped from backend yet, or if it changed
+                if (total > 0 && skipped >= 0 && data.skipped !== undefined) {
+                  // Check if this is the first time we're getting skipped from backend
+                  // We know it's the first time if:
+                  // 1. initialEmptyRows is 0 (not set yet), OR
+                  // 2. process.stats.skipped is undefined (we haven't received it yet), OR
+                  // 3. The skipped value changed (meaning backend just calculated it)
+                  const previousSkipped = process.stats.skipped;
+                  if (updatedInitialEmptyRows === 0 || previousSkipped === undefined || previousSkipped !== skipped) {
+                    updatedInitialEmptyRows = total - skipped;
+                    console.log(`📊 Monitor: Set initialEmptyRows from progress message: ${updatedInitialEmptyRows} (total: ${total}, skipped: ${skipped}, previousSkipped: ${previousSkipped})`);
+                  } else {
+                    // Already set correctly, keep the original value (don't change it)
+                    updatedInitialEmptyRows = process.stats.initialEmptyRows;
+                  }
+                }
+              } else if (process.stepName === "AI Source Comparables") {
+                // For AI Source Comparables, use success count
+                if (updatedInitialEmptyRows === 0 && success > 0) {
+                  updatedInitialEmptyRows = success;
+                  console.log(`📊 Monitor: Updated initialEmptyRows from progress: ${updatedInitialEmptyRows} (success: ${success})`);
+                }
+              }
+              
+              // Calculate progress: based on empty rows being processed, not total rows
+              // Progress = (success / emptyRows) * 100 when emptyRows > 0
+              let progress = 0;
+              if (updatedInitialEmptyRows > 0) {
+                progress = Math.min(100, (success / updatedInitialEmptyRows) * 100);
+              } else if (total > 0) {
+                // Fallback: if emptyRows not calculated yet, use total (but this should be temporary)
+                progress = Math.min(100, ((success + skipped) / total) * 100);
+              }
               
               console.log(`📊 Monitor: Updating progress for ${processId}:`, {
                 dataReceived: {
@@ -549,18 +585,6 @@ export default function Monitor() {
                   progress: process.progress
                 }
               });
-              
-              // Update initialEmptyRows if it's 0 and we now have skipped rows
-              let updatedInitialEmptyRows = process.stats.initialEmptyRows;
-              if (updatedInitialEmptyRows === 0 && skipped > 0) {
-                if (process.stepName === "Build Description" || process.stepName === "Generate AI Data") {
-                  updatedInitialEmptyRows = total - skipped;
-                  console.log(`📊 Monitor: Updated initialEmptyRows from progress: ${updatedInitialEmptyRows} (total: ${total}, skipped: ${skipped})`);
-                } else if (process.stepName === "AI Source Comparables") {
-                  updatedInitialEmptyRows = success;
-                  console.log(`📊 Monitor: Updated initialEmptyRows from progress: ${updatedInitialEmptyRows} (success: ${success})`);
-                }
-              }
               
               const updatedProcess = {
                 ...process,
@@ -626,6 +650,66 @@ export default function Monitor() {
               
               return updated;
             });
+          } else if (data.type === 'cancelled') {
+            console.log(`🚫 Monitor WebSocket received cancelled message for process ${processId}:`, data);
+            setProcesses(prev => {
+              const process = prev[processId];
+              if (!process) {
+                console.warn(`⚠️ Monitor: Process ${processId} not found in state for cancelled message`);
+                return prev;
+              }
+              
+              // Cancel auto-completion timeout if it exists
+              if (process.completionTimeout) {
+                clearTimeout(process.completionTimeout);
+                console.log(`⏰ Monitor: Cancelled auto-completion timeout for ${processId}`);
+              }
+              
+              // Stop timer
+              if (processTimersRef.current[processId]) {
+                clearInterval(processTimersRef.current[processId]);
+                delete processTimersRef.current[processId];
+              }
+
+              // Update initialEmptyRows with backend data if available
+              const total = data.total || process.stats.total;
+              const skipped = data.skipped !== undefined ? data.skipped : process.stats.skipped;
+              let finalInitialEmptyRows = process.stats.initialEmptyRows;
+              if (process.stepName === "Build Description" || process.stepName === "Generate AI Data") {
+                if (total > 0 && skipped >= 0 && skipped !== undefined) {
+                  finalInitialEmptyRows = total - skipped;
+                  console.log(`📊 Monitor: Updated initialEmptyRows in cancelled handler: ${finalInitialEmptyRows} (total: ${total}, skipped: ${skipped})`);
+                }
+              }
+
+              const updatedProcess = {
+                ...process,
+                isActive: false,
+                isCompleted: false,
+                isCancelled: true,
+                stats: {
+                  ...process.stats,
+                  total: total,
+                  processed: data.processed || process.stats.processed,
+                  success: data.success !== undefined ? data.success : process.stats.success,
+                  errors: data.errors !== undefined ? data.errors : process.stats.errors,
+                  skipped: skipped !== undefined ? skipped : process.stats.skipped,
+                  initialEmptyRows: finalInitialEmptyRows,
+                },
+              };
+
+              console.log(`🚫 Monitor: Process ${processId} marked as cancelled:`, {
+                isCancelled: updatedProcess.isCancelled,
+                isActive: updatedProcess.isActive,
+                isCompleted: updatedProcess.isCompleted,
+                initialEmptyRows: updatedProcess.stats.initialEmptyRows
+              });
+
+              return {
+                ...prev,
+                [processId]: updatedProcess,
+              };
+            });
           } else if (data.type === 'complete') {
             console.log(`✅ Monitor WebSocket received complete message for process ${processId}:`, data);
             setProcesses(prev => {
@@ -660,13 +744,16 @@ export default function Monitor() {
                 elapsedTime: finalElapsedTime
               });
 
-              // Update initialEmptyRows if it's still 0
+              // Update initialEmptyRows with backend data (always update for Generate AI Data to get accurate count)
               let finalInitialEmptyRows = process.stats.initialEmptyRows;
-              if (finalInitialEmptyRows === 0 && skipped > 0) {
-                if (process.stepName === "Build Description" || process.stepName === "Generate AI Data") {
+              if (process.stepName === "Build Description" || process.stepName === "Generate AI Data") {
+                if (total > 0 && skipped >= 0) {
+                  // Use backend data: initialEmptyRows = total - skipped (rows that were empty at start)
                   finalInitialEmptyRows = total - skipped;
                   console.log(`📊 Monitor: Updated initialEmptyRows in complete handler: ${finalInitialEmptyRows} (total: ${total}, skipped: ${skipped})`);
-                } else if (process.stepName === "AI Source Comparables") {
+                }
+              } else if (process.stepName === "AI Source Comparables") {
+                if (finalInitialEmptyRows === 0 && success > 0) {
                   finalInitialEmptyRows = success;
                   console.log(`📊 Monitor: Updated initialEmptyRows in complete handler: ${finalInitialEmptyRows} (success: ${success})`);
                 }
@@ -945,6 +1032,7 @@ export default function Monitor() {
                   elapsedTime={process.elapsedTime || 0}
                   isCompleted={Boolean(process.isCompleted)}
                   isActive={Boolean(process.isActive)}
+                  isCancelled={Boolean(process.isCancelled)}
                   onRemove={handleRemoveProcess}
                   onMarkAsCompleted={handleMarkAsCompleted}
                   progress={process.progress || 0}

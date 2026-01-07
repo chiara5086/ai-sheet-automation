@@ -1,5 +1,5 @@
 
-from fastapi import APIRouter, HTTPException, Query
+from fastapi import APIRouter, HTTPException, Query, Request, Response
 from pydantic import BaseModel
 from google_sheets import get_sheet_data, update_sheet_data
 import re
@@ -7,6 +7,7 @@ from sheet_utils import find_column_indices
 from process_steps import build_description
 from websocket_manager import manager
 from database import save_history, get_history, get_history_by_sheet, save_or_update_process, get_active_processes, delete_process
+from auth import verify_google_token, create_session, get_user_from_session, delete_session, get_current_user
 from typing import Optional
 
 
@@ -47,6 +48,14 @@ class HistoryRequest(BaseModel):
     message: str
     timestamp: str
     time: str
+
+# Pydantic model for login request
+class LoginRequest(BaseModel):
+    token: str  # Google ID token from frontend
+
+# Pydantic model for logout request
+class LogoutRequest(BaseModel):
+    session_token: str
 
 # Simple test endpoint to verify POST requests work
 @router.post("/test-process")
@@ -317,31 +326,36 @@ async def process_step(request: ProcessRequest):
                 else:
                     print(f"WARNING: No active WebSocket connections for session {request.session_id} (early send), message not sent", flush=True)
             
-            # Write back only the AI Data column
-            ai_data_idx = col_indices.get('AI Data')
-            if ai_data_idx is not None:
-                col_letter = get_column_letter(ai_data_idx)
-                start_row = 3
-                end_row = start_row + len(updated_rows) - 1
-                out_range = f"{sheet_name}!{col_letter}{start_row}:{col_letter}{end_row}" if sheet_name else f"{col_letter}{start_row}:{col_letter}{end_row}"
-                values = [[row[ai_data_idx] if len(row) > ai_data_idx else ""] for row in updated_rows]
-                
-                # Count how many non-empty values we're writing
-                non_empty_count = sum(1 for v in values if v and v[0] and str(v[0]).strip())
-                print(f"DEBUG: Writing AI Data to sheet: {non_empty_count} non-empty values out of {len(values)} total", flush=True)
-                print(f"DEBUG: Range: {out_range}, Column: {col_letter}", flush=True)
-                
-                try:
-                    update_sheet_data(sheetId, out_range, values)
-                    print(f"✅ Successfully wrote AI Data to sheet", flush=True)
-                except Exception as e:
-                    error_msg = f'Failed to write AI Data to sheet: {str(e)}'
-                    print(f"❌ ERROR: {error_msg}", flush=True)
-                    errors.append(error_msg)
-                    import traceback
-                    traceback.print_exc()
+            # Check if process was cancelled before writing to sheet
+            if request.session_id and manager.is_cancelled(request.session_id):
+                print(f"DEBUG: Process was cancelled, skipping write to sheet", flush=True)
+                # Don't write to sheet if cancelled
             else:
-                print(f"WARNING: AI Data column index not found, cannot write to sheet", flush=True)
+                # Write back only the AI Data column
+                ai_data_idx = col_indices.get('AI Data')
+                if ai_data_idx is not None:
+                    col_letter = get_column_letter(ai_data_idx)
+                    start_row = 3
+                    end_row = start_row + len(updated_rows) - 1
+                    out_range = f"{sheet_name}!{col_letter}{start_row}:{col_letter}{end_row}" if sheet_name else f"{col_letter}{start_row}:{col_letter}{end_row}"
+                    values = [[row[ai_data_idx] if len(row) > ai_data_idx else ""] for row in updated_rows]
+                    
+                    # Count how many non-empty values we're writing
+                    non_empty_count = sum(1 for v in values if v and v[0] and str(v[0]).strip())
+                    print(f"DEBUG: Writing AI Data to sheet: {non_empty_count} non-empty values out of {len(values)} total", flush=True)
+                    print(f"DEBUG: Range: {out_range}, Column: {col_letter}", flush=True)
+                    
+                    try:
+                        update_sheet_data(sheetId, out_range, values)
+                        print(f"✅ Successfully wrote AI Data to sheet", flush=True)
+                    except Exception as e:
+                        error_msg = f'Failed to write AI Data to sheet: {str(e)}'
+                        print(f"❌ ERROR: {error_msg}", flush=True)
+                        errors.append(error_msg)
+                        import traceback
+                        traceback.print_exc()
+                else:
+                    print(f"WARNING: AI Data column index not found, cannot write to sheet", flush=True)
             
         elif step == "Build Description":
             # Count rows that were already filled before processing
@@ -355,15 +369,20 @@ async def process_step(request: ProcessRequest):
                             already_filled_count += 1
             
             updated_rows, errors = await build_description(rows, col_indices, session_id=request.session_id, custom_prompt=custom_prompt)
-            # Write back only the description column
-            if desc_idx is not None:
-                col_letter = get_column_letter(desc_idx)
-                # Calculate the range: from row 3 to row (3 + number of rows - 1)
-                start_row = 3
-                end_row = start_row + len(updated_rows) - 1
-                out_range = f"{sheet_name}!{col_letter}{start_row}:{col_letter}{end_row}" if sheet_name else f"{col_letter}{start_row}:{col_letter}{end_row}"
-                values = [[row[desc_idx] if len(row) > desc_idx else ""] for row in updated_rows]
-                update_sheet_data(sheetId, out_range, values)
+            # Check if process was cancelled before writing to sheet
+            if request.session_id and manager.is_cancelled(request.session_id):
+                print(f"DEBUG: Process was cancelled, skipping write to sheet", flush=True)
+                # Don't write to sheet if cancelled
+            else:
+                # Write back only the description column
+                if desc_idx is not None:
+                    col_letter = get_column_letter(desc_idx)
+                    # Calculate the range: from row 3 to row (3 + number of rows - 1)
+                    start_row = 3
+                    end_row = start_row + len(updated_rows) - 1
+                    out_range = f"{sheet_name}!{col_letter}{start_row}:{col_letter}{end_row}" if sheet_name else f"{col_letter}{start_row}:{col_letter}{end_row}"
+                    values = [[row[desc_idx] if len(row) > desc_idx else ""] for row in updated_rows]
+                    update_sheet_data(sheetId, out_range, values)
             
             # Calculate stats for Build Description
             # Count rows that now have a description (after processing)
@@ -430,16 +449,21 @@ async def process_step(request: ProcessRequest):
                 else:
                     print(f"WARNING: No active WebSocket connections for session {request.session_id} (early send), message not sent", flush=True)
             
-            # Write back only the AI Comparable Price column
-            comparable_idx = col_indices.get('AI Comparable Price')
-            if comparable_idx is not None:
-                col_letter = get_column_letter(comparable_idx)
-                start_row = 3
-                end_row = start_row + len(updated_rows) - 1
-                out_range = f"{sheet_name}!{col_letter}{start_row}:{col_letter}{end_row}" if sheet_name else f"{col_letter}{start_row}:{col_letter}{end_row}"
-                values = [[row[comparable_idx] if len(row) > comparable_idx else ""] for row in updated_rows]
-                update_sheet_data(sheetId, out_range, values)
-                print(f"DEBUG: Wrote {len(updated_rows)} comparable entries to column {col_letter}", flush=True)
+            # Check if process was cancelled before writing to sheet
+            if request.session_id and manager.is_cancelled(request.session_id):
+                print(f"DEBUG: Process was cancelled, skipping write to sheet", flush=True)
+                # Don't write to sheet if cancelled
+            else:
+                # Write back only the AI Comparable Price column
+                comparable_idx = col_indices.get('AI Comparable Price')
+                if comparable_idx is not None:
+                    col_letter = get_column_letter(comparable_idx)
+                    start_row = 3
+                    end_row = start_row + len(updated_rows) - 1
+                    out_range = f"{sheet_name}!{col_letter}{start_row}:{col_letter}{end_row}" if sheet_name else f"{col_letter}{start_row}:{col_letter}{end_row}"
+                    values = [[row[comparable_idx] if len(row) > comparable_idx else ""] for row in updated_rows]
+                    update_sheet_data(sheetId, out_range, values)
+                    print(f"DEBUG: Wrote {len(updated_rows)} comparable entries to column {col_letter}", flush=True)
         elif step == "Extract price from AI Comparable":
             print(f"\n{'='*60}", flush=True)
             print(f"DEBUG: Starting Extract price from AI Comparable", flush=True)
@@ -459,12 +483,21 @@ async def process_step(request: ProcessRequest):
                     if len(row) <= price_idx or not row[price_idx] or not str(row[price_idx]).strip():
                         empty_before += 1
             
-            if price_idx is not None and filled_rows:
+            # Check if process was cancelled before writing to sheet
+            if request.session_id and manager.is_cancelled(request.session_id):
+                print(f"DEBUG: Process was cancelled, skipping write to sheet", flush=True)
+                # Don't write to sheet if cancelled
+            elif price_idx is not None and filled_rows:
                 col_letter = get_column_letter(price_idx)
                 print(f"DEBUG: Writing {len(filled_rows)} prices to column {col_letter}", flush=True)  # Debug log
                 
                 # Update each filled row individually for accuracy
                 for row_num in filled_rows:
+                    # Check if process was cancelled before each write
+                    if request.session_id and manager.is_cancelled(request.session_id):
+                        print(f"DEBUG: Process was cancelled, stopping writes at row {row_num}", flush=True)
+                        break
+                    
                     # Convert sheet row number to array index (row 3 = index 0)
                     array_idx = row_num - 3
                     if 0 <= array_idx < len(updated_rows):
@@ -502,12 +535,21 @@ async def process_step(request: ProcessRequest):
                     if len(row) <= price_idx or not row[price_idx] or not str(row[price_idx]).strip():
                         empty_before += 1
             
-            if price_idx is not None and filled_rows:
+            # Check if process was cancelled before writing to sheet
+            if request.session_id and manager.is_cancelled(request.session_id):
+                print(f"DEBUG: Process was cancelled, skipping write to sheet", flush=True)
+                # Don't write to sheet if cancelled
+            elif price_idx is not None and filled_rows:
                 col_letter = get_column_letter(price_idx)
                 print(f"DEBUG: Writing {len(filled_rows)} new prices to column {col_letter}", flush=True)  # Debug log
                 
                 # Update each filled row individually for accuracy
                 for row_num in filled_rows:
+                    # Check if process was cancelled before each write
+                    if request.session_id and manager.is_cancelled(request.session_id):
+                        print(f"DEBUG: Process was cancelled, stopping writes at row {row_num}", flush=True)
+                        break
+                    
                     # Convert sheet row number to array index (row 3 = index 0)
                     array_idx = row_num - 3
                     if 0 <= array_idx < len(updated_rows):
@@ -545,12 +587,21 @@ async def process_step(request: ProcessRequest):
                     if len(row) <= price_idx or not row[price_idx] or not str(row[price_idx]).strip():
                         empty_before += 1
             
-            if price_idx is not None and filled_rows:
+            # Check if process was cancelled before writing to sheet
+            if request.session_id and manager.is_cancelled(request.session_id):
+                print(f"DEBUG: Process was cancelled, skipping write to sheet", flush=True)
+                # Don't write to sheet if cancelled
+            elif price_idx is not None and filled_rows:
                 col_letter = get_column_letter(price_idx)
                 print(f"DEBUG: Writing {len(filled_rows)} similar comparable prices to column {col_letter}", flush=True)
                 
                 # Update each filled row individually for accuracy
                 for row_num in filled_rows:
+                    # Check if process was cancelled before each write
+                    if request.session_id and manager.is_cancelled(request.session_id):
+                        print(f"DEBUG: Process was cancelled, stopping writes at row {row_num}", flush=True)
+                        break
+                    
                     # Convert sheet row number to array index (row 3 = index 0)
                     array_idx = row_num - 3
                     if 0 <= array_idx < len(updated_rows):
