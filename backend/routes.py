@@ -7,7 +7,8 @@ from sheet_utils import find_column_indices
 from process_steps import build_description
 from websocket_manager import manager
 from database import save_history, get_history, get_history_by_sheet, save_or_update_process, get_active_processes, delete_process
-from auth import verify_google_token, create_session, get_user_from_session, delete_session, get_current_user
+# TODO: Uncomment when auth is ready
+# from auth import verify_google_token, create_session, get_user_from_session, delete_session, get_current_user
 from typing import Optional
 
 
